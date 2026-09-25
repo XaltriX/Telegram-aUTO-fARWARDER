@@ -1,4 +1,3 @@
-```python
 """
 Single persistent, in-place-edited dashboard message (point 25/26), plus
 throttled temporary notifications (point 27) that auto-delete.
@@ -257,5 +256,5 @@ class DashboardManager:
 
 
 dashboard_manager: "DashboardManager" = None  # set by worker.py after bot client exists
-```
+
 
