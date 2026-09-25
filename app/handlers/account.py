@@ -38,6 +38,21 @@ def register(client):
             parse_mode="html", buttons=[[Button.inline("\u2B05\uFE0F Back", b"account:menu")]],
         )
 
+    @client.on(events.CallbackQuery(pattern=b"^account:login_retry$"))
+    @owner_only_callback
+    async def _login_retry(event):
+        # A Telegram login code is single-use and a newer code invalidates an
+        # older one. Always discard the old Telethon client before retrying so
+        # the next attempt cannot reuse its phone_code_hash.
+        await account_manager.cancel_login()
+        conversation_state.set_flow(event.chat_id, flows.LOGIN_PHONE)
+        await db.set_login_state(LoginState.PHONE)
+        await event.edit(
+            "\U0001F510 <b>Login - Step 1/3</b>\n\nThe previous code is no longer valid. "
+            "Send the phone number again to request a fresh code.\n\nSend /cancel to abort.",
+            parse_mode="html", buttons=[[Button.inline("\u2B05\uFE0F Back", b"account:menu")]],
+        )
+
     @client.on(events.CallbackQuery(pattern=b"^account:logout$"))
     @owner_only_callback
     async def _logout_confirm(event):
@@ -73,7 +88,9 @@ async def handle_text(client, event, flow: str) -> bool:
             conversation_state.set_flow(event.chat_id, flows.LOGIN_CODE)
             await event.respond(
                 "\U0001F4F2 <b>Login - Step 2/3</b>\n\nEnter the login code Telegram just "
-                "sent you (as digits, e.g. <code>12345</code>).\n\nSend /cancel to abort.",
+                "sent you (as digits, e.g. <code>12345</code>).\n\n"
+                "Use only the newest code. If Telegram sends another code, the older code "
+                "expires immediately.\n\nSend /cancel to abort.",
                 parse_mode="html",
             )
         else:
@@ -81,7 +98,7 @@ async def handle_text(client, event, flow: str) -> bool:
         return True
 
     if flow == flows.LOGIN_CODE:
-        code = event.raw_text.strip()
+        code = event.raw_text.strip().replace(" ", "")
         # We deliberately never log the code (point 21/34/40).
         result = await account_manager.submit_code(code)
         if result == "OK":
@@ -96,6 +113,13 @@ async def handle_text(client, event, flow: str) -> bool:
                 "\U0001F512 <b>Login - Step 3/3</b>\n\nThis account has 2FA enabled. "
                 "Enter your Telegram password.\n\nSend /cancel to abort.",
                 parse_mode="html",
+            )
+        elif "expired" in result.lower():
+            conversation_state.clear(event.chat_id)
+            await event.respond(
+                f"\u274C {result}\n\nTelegram invalidates an old code when a newer "
+                "code is requested. Tap below and send the phone number again.",
+                buttons=[[Button.inline("\U0001F504 Request New Code", b"account:login_retry")]],
             )
         else:
             await event.respond(f"\u274C {result}")
@@ -124,7 +148,7 @@ async def cancel_flow(chat_id: int, flow: str):
 
 
 async def _show_menu(event):
-    session = await db.get_session()
+    session = await db.get_session() or {}
     connected = session.get("connected", False)
     phone = session.get("phone")
     lines = ["\U0001F464 <b>Account</b>", ""]
