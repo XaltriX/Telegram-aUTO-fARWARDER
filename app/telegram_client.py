@@ -84,8 +84,10 @@ class AccountManager:
         except (AuthKeyUnregisteredError, UserDeactivatedBanError) as e:
             logger.error("Stored session invalid: %s. Clearing session.", type(e).__name__)
             await db.clear_session()
+            await client.disconnect()
         except Exception:
             logger.exception("Failed to reconnect personal account on startup")
+            await client.disconnect()
 
     async def disconnect(self):
         if self.client:
@@ -97,12 +99,40 @@ class AccountManager:
     # ------------------------------------------------------------------
     # Login state machine (each step called from the bot, owner-only)
     # ------------------------------------------------------------------
+    async def _clear_pending_login(self, *, set_idle: bool = True):
+        """Dispose of an unauthorised client after a failed/expired login."""
+        client = self.client
+        self.client = None
+        self._phone_code_hash = None
+        self._pending_phone = None
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                logger.debug("Failed to disconnect abandoned login client", exc_info=True)
+        if set_idle:
+            await db.set_login_state(LoginState.IDLE)
+
     async def start_login(self, phone: str) -> str:
         async with self._login_lock:
-            if self.is_connected():
-                return "An account is already connected. Logout first."
-            client = TelegramClient(StringSession(), config.API_ID, config.API_HASH,
-                                     connection_retries=10, retry_delay=2)
+            # An expired OTP leaves the old Telethon client connected unless it
+            # is explicitly discarded. Clean up any unauthorised stale client
+            # so a new attempt does not incorrectly report "already connected".
+            if self.client:
+                if self.is_connected():
+                    try:
+                        authorized = await self.client.is_user_authorized()
+                    except Exception:
+                        authorized = False
+                    if authorized:
+                        await db.set_connected(True)
+                        return "An account is already connected. Logout first."
+                await self._clear_pending_login()
+
+            client = TelegramClient(
+                StringSession(), config.API_ID, config.API_HASH,
+                connection_retries=10, retry_delay=2,
+            )
             await client.connect()
             try:
                 sent = await client.send_code_request(phone)
@@ -112,55 +142,81 @@ class AccountManager:
             except FloodWaitError as e:
                 await client.disconnect()
                 return f"Telegram asked us to wait {e.seconds}s before requesting another code."
+            except Exception as e:
+                await client.disconnect()
+                logger.exception("Failed to request Telegram login code")
+                return f"Could not send login code: {type(e).__name__}. Try again."
+
             self._phone_code_hash = sent.phone_code_hash
             self._pending_phone = phone
             self.client = client  # not authorized yet, but kept for the next step
+            await db.set_connected(False)
             await db.set_login_state(LoginState.CODE, phone=phone)
             return "OK"
 
     async def submit_code(self, code: str) -> str:
         async with self._login_lock:
-            if not self.client or not self._pending_phone:
-                return "No login in progress. Start again with /account."
+            if not self.client or not self._pending_phone or not self._phone_code_hash:
+                return "No login in progress. Start again from Account → Login Account."
             try:
                 await self.client.sign_in(
-                    phone=self._pending_phone, code=code, phone_code_hash=self._phone_code_hash
+                    phone=self._pending_phone,
+                    code=code,
+                    phone_code_hash=self._phone_code_hash,
                 )
             except PhoneCodeInvalidError:
-                return "Invalid code. Try again."
+                return "Invalid code. Try again, or request a new code if it expired."
             except PhoneCodeExpiredError:
                 await db.set_login_state(LoginState.FAILED)
-                return "Code expired. Start login again."
+                await self._clear_pending_login(set_idle=False)
+                return "Code expired. Press Login Account and request a new code."
             except SessionPasswordNeededError:
                 await db.set_login_state(LoginState.PASSWORD, phone=self._pending_phone)
                 return "2FA_REQUIRED"
+            except FloodWaitError as e:
+                return f"Telegram asked us to wait {e.seconds}s before trying again."
+            except Exception as e:
+                logger.exception("Failed to submit Telegram login code")
+                return f"Login failed: {type(e).__name__}. Start again."
             return await self._finalize_login()
 
     async def submit_password(self, password: str) -> str:
         async with self._login_lock:
-            if not self.client:
-                return "No login in progress. Start again with /account."
+            if not self.client or not self._pending_phone:
+                return "No login in progress. Start again from Account → Login Account."
             try:
                 await self.client.sign_in(password=password)
             except PasswordHashInvalidError:
                 return "Incorrect 2FA password. Try again."
+            except FloodWaitError as e:
+                return f"Telegram asked us to wait {e.seconds}s before trying again."
+            except Exception as e:
+                logger.exception("Failed to submit Telegram 2FA password")
+                return f"2FA login failed: {type(e).__name__}. Try again."
             return await self._finalize_login()
 
     async def _finalize_login(self) -> str:
-        me = await self.client.get_me()
-        string_session = self.client.session.save()
-        await db.save_session_string(string_session, phone=self._pending_phone)
-        await db.set_connected(True)
-        self._phone_code_hash = None
-        self._pending_phone = None
-        logger.info("Personal account login complete: %s (id=%s)", me.username or me.first_name, me.id)
-        return "OK"
+        try:
+            me = await self.client.get_me()
+            string_session = self.client.session.save()
+            await db.save_session_string(string_session, phone=self._pending_phone)
+            await db.set_connected(True)
+            self._phone_code_hash = None
+            self._pending_phone = None
+            logger.info("Personal account login complete: %s (id=%s)", me.username or me.first_name, me.id)
+            return "OK"
+        except Exception:
+            logger.exception("Could not persist completed personal-account login")
+            await self._clear_pending_login(set_idle=False)
+            await db.clear_session()
+            return "Login completed at Telegram, but saving the session failed. Please try again."
 
     async def logout(self):
         async with self._login_lock:
             if self.client:
                 try:
-                    await self.client.log_out()
+                    if await self.client.is_user_authorized():
+                        await self.client.log_out()
                 except Exception:
                     logger.exception("Error during log_out(), clearing local state anyway")
                 try:
@@ -175,13 +231,10 @@ class AccountManager:
     async def cancel_login(self):
         async with self._login_lock:
             if self.client and not await self._safe_is_authorized():
-                try:
-                    await self.client.disconnect()
-                except Exception:
-                    pass
-                self.client = None
-            self._phone_code_hash = None
-            self._pending_phone = None
+                await self._clear_pending_login(set_idle=False)
+            else:
+                self._phone_code_hash = None
+                self._pending_phone = None
             await db.set_login_state(LoginState.IDLE)
 
     async def _safe_is_authorized(self) -> bool:
