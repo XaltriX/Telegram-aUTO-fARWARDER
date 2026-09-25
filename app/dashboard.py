@@ -47,12 +47,22 @@ class DashboardManager:
         return [
             [
                 Button.inline(
+                    "\U0001F464 Account",
+                    b"account:menu",
+                ),
+                Button.inline(
                     "\U0001F4E1 Sources",
                     b"src:menu",
                 ),
+            ],
+            [
                 Button.inline(
                     "\U0001F4E5 Queue",
                     b"queue:menu",
+                ),
+                Button.inline(
+                    "\U0001F3AF Destination",
+                    b"dest:menu",
                 ),
             ],
             [
@@ -138,9 +148,9 @@ class DashboardManager:
         )
 
         lines = [
-            "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557",
+            "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557",
             "\u26A1 TG FORWARDER",
-            "\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D",
+            "\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D",
             "",
             f"{system_icon} SYSTEM      {system_status}",
             f"\U0001F464 ACCOUNT     {account_status}",
