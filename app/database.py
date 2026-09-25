@@ -166,7 +166,8 @@ class Database:
     # Settings
     # ------------------------------------------------------------------
     async def get_settings(self) -> dict:
-        return await self.db.settings.find_one({"_id": SETTINGS_ID})
+        doc = await self.db.settings.find_one({"_id": SETTINGS_ID})
+        return doc or {}
 
     async def update_settings(self, update: dict):
         await self.db.settings.update_one({"_id": SETTINGS_ID}, {"$set": update})
@@ -188,7 +189,8 @@ class Database:
     # Account session
     # ------------------------------------------------------------------
     async def get_session(self) -> dict:
-        return await self.db.account_session.find_one({"_id": SESSION_ID})
+        doc = await self.db.account_session.find_one({"_id": SESSION_ID})
+        return doc or {}
 
     async def save_session_string(self, string_session: str, phone: str = None):
         update = {"string_session": string_session, "connected": True,
@@ -422,7 +424,8 @@ class Database:
     # Stats
     # ------------------------------------------------------------------
     async def get_stats(self) -> dict:
-        return await self.db.stats.find_one({"_id": STATS_ID})
+        doc = await self.db.stats.find_one({"_id": STATS_ID})
+        return doc or {}
 
     async def incr_stat(self, field: str, amount: int = 1):
         await self.db.stats.update_one({"_id": STATS_ID}, {"$inc": {field: amount}})
@@ -454,7 +457,8 @@ class Database:
     # Dashboard
     # ------------------------------------------------------------------
     async def get_dashboard_state(self) -> dict:
-        return await self.db.dashboard_state.find_one({"_id": DASHBOARD_ID})
+        doc = await self.db.dashboard_state.find_one({"_id": DASHBOARD_ID})
+        return doc or {}
 
     async def set_dashboard_message(self, chat_id: int, message_id: int):
         await self.db.dashboard_state.update_one(
