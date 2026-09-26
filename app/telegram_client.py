@@ -2,38 +2,32 @@
 Manages the PERSONAL Telegram account (the one that actually reads source
 channels and forwards messages). This is a Telethon MTProto user client.
 
-Session persistence: Heroku's filesystem is ephemeral, so we never rely on
-a local .session file. Telethon's StringSession is used instead - the
-session string is stored in MongoDB and loaded back on every process start.
+LOGIN MODEL: session-string paste, not in-bot OTP.
+----------------------------------------------------
+Telegram's server-side anti-scam system blocks a login the moment its OTP
+code is typed into *any* Telegram chat - including a private chat with our
+own control bot ("this code was previously shared by your account"). That
+block happens on Telegram's side regardless of what this application does,
+so an in-bot phone -> code -> 2FA flow cannot work reliably.
 
-Login flow is a small state machine restricted to OWNER_ID, driven by the
-control bot (see handlers/account.py):
+Instead, the owner generates a Telethon StringSession once, locally,
+completely outside of any Telegram chat (see generate_session.py at the
+project root, run from a terminal), and pastes that string into the bot.
+The string itself is not a login code, so Telegram does not intercept it.
 
-    LOGIN_IDLE -> LOGIN_PHONE -> LOGIN_CODE -> [LOGIN_2FA] -> LOGIN_COMPLETE
-                                                            -> LOGIN_FAILED
-
-IMPORTANT: `self.client` only ever holds a fully-authorized client (the one
-the scheduler/monitor use to read channels and forward). A login-in-progress
-client (connected, but not yet signed in) is held separately in
-`self._login_client` so `get_client()`/`is_connected()` can never hand a
-half-authorized client to the rest of the app, and so "an account is
-already connected" only fires when a real account is actually connected.
+Session persistence: Heroku's filesystem is ephemeral, so the session is
+never kept as a local file - the StringSession is stored in MongoDB and
+reloaded on every process start. A StringSession does not expire on its
+own; it stays valid until the owner explicitly logs out / terminates that
+session from Telegram's "Active Sessions", or Telegram revokes it for
+security reasons (e.g. password change).
 """
 import asyncio
 import logging
 from typing import Optional
 
 from telethon import TelegramClient
-from telethon.errors import (
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
-    PhoneNumberInvalidError,
-    SessionPasswordNeededError,
-    PasswordHashInvalidError,
-    FloodWaitError,
-    AuthKeyUnregisteredError,
-    UserDeactivatedBanError,
-)
+from telethon.errors import AuthKeyUnregisteredError, UserDeactivatedBanError
 from telethon.sessions import StringSession
 
 from app.config import config
@@ -44,21 +38,14 @@ logger = logging.getLogger(__name__)
 
 
 class AccountManager:
-    """
-    Owns the lifecycle of the single personal-account Telethon client.
-    Only one login attempt may be in flight at a time (protected by a lock).
-    """
+    """Owns the lifecycle of the single personal-account Telethon client."""
 
     def __init__(self):
         self.client: Optional[TelegramClient] = None  # authorized only
-        self._login_client: Optional[TelegramClient] = None  # login-in-progress only
         self._login_lock = asyncio.Lock()
-        self._phone_code_hash: Optional[str] = None
-        self._pending_phone: Optional[str] = None
 
     # ------------------------------------------------------------------
     def is_connected(self) -> bool:
-        """True only when a fully-authorized account client is connected."""
         return self.client is not None and self.client.is_connected()
 
     async def get_client(self) -> Optional[TelegramClient]:
@@ -67,12 +54,13 @@ class AccountManager:
     async def bootstrap(self):
         """
         Called at process startup. If a session string is already stored,
-        reconnect without requiring OTP (unless Telegram has revoked it).
+        reconnect without any owner interaction (unless Telegram has
+        revoked it, in which case the owner must paste a fresh string).
         """
         session_doc = await db.get_session()
         string_session = session_doc.get("string_session") if session_doc else None
         if not string_session:
-            logger.info("No stored account session - login required via the bot.")
+            logger.info("No stored account session - paste a session string via the bot.")
             return
 
         client = TelegramClient(
@@ -82,7 +70,7 @@ class AccountManager:
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                logger.warning("Stored session is no longer authorized. Clearing it; re-login required.")
+                logger.warning("Stored session is no longer authorized. Clearing it; a fresh session string is required.")
                 await db.clear_session()
                 await self._safe_disconnect(client)
                 return
@@ -102,7 +90,6 @@ class AccountManager:
 
     async def disconnect(self):
         await self._safe_disconnect(self.client)
-        await self._safe_disconnect(self._login_client)
 
     @staticmethod
     async def _safe_disconnect(client: Optional[TelegramClient]):
@@ -113,117 +100,56 @@ class AccountManager:
                 pass
 
     # ------------------------------------------------------------------
-    # Login state machine (each step called from the bot, owner-only)
+    # Login by pasted session string (owner-only, see handlers/account.py)
     # ------------------------------------------------------------------
-    async def start_login(self, phone: str) -> str:
+    async def login_with_string(self, string_session: str) -> str:
+        """
+        Validate and connect using an owner-supplied StringSession. Returns
+        "OK" on success, or a human-readable error otherwise. The raw
+        string is never logged (point 21/34/40) - only success/failure and
+        the resulting account's username/id are.
+        """
         async with self._login_lock:
             if self.is_connected():
                 return "An account is already connected. Logout first."
 
-            # Any stale/abandoned login-in-progress client is cleaned up
-            # before starting a fresh attempt, so a previous expired/invalid
-            # code never causes a false "already connected".
-            await self._cleanup_login_client()
-
-            client = TelegramClient(StringSession(), config.API_ID, config.API_HASH,
-                                     connection_retries=10, retry_delay=2)
-            await client.connect()
-            try:
-                sent = await client.send_code_request(phone)
-            except PhoneNumberInvalidError:
-                await self._safe_disconnect(client)
-                return "Invalid phone number format. Use international format, e.g. +15551234567."
-            except FloodWaitError as e:
-                await self._safe_disconnect(client)
-                return f"Telegram asked us to wait {e.seconds}s before requesting another code."
-            except Exception as e:
-                await self._safe_disconnect(client)
-                logger.exception("Unexpected error requesting login code")
-                return f"Couldn't request a login code: {type(e).__name__}. Try again."
-
-            self._phone_code_hash = sent.phone_code_hash
-            self._pending_phone = phone
-            self._login_client = client
-            await db.set_login_state(LoginState.CODE, phone=phone)
-            return "OK"
-
-    async def submit_code(self, code: str) -> str:
-        async with self._login_lock:
-            if not self._login_client or not self._pending_phone or not self._phone_code_hash:
-                await self._cleanup_login_client()
-                await db.set_login_state(LoginState.IDLE)
-                return "No login in progress. Press Login Account to start again."
+            session_str = (string_session or "").strip()
+            if not session_str:
+                return "That doesn't look like a session string. Paste the full string with nothing else."
 
             try:
-                await self._login_client.sign_in(
-                    phone=self._pending_phone, code=code, phone_code_hash=self._phone_code_hash
+                client = TelegramClient(
+                    StringSession(session_str), config.API_ID, config.API_HASH,
+                    connection_retries=10, retry_delay=2,
                 )
-            except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
-                # Telegram invalidates the whole login attempt once a wrong
-                # or expired code is submitted - retrying the same code
-                # never succeeds, so the login client must be torn down and
-                # the owner must request a brand new code.
-                await self._cleanup_login_client()
-                await db.set_login_state(LoginState.FAILED)
-                reason = "expired" if isinstance(e, PhoneCodeExpiredError) else "invalid"
-                return f"CODE_{reason.upper()}"
-            except SessionPasswordNeededError:
-                await db.set_login_state(LoginState.PASSWORD, phone=self._pending_phone)
-                return "2FA_REQUIRED"
-            except FloodWaitError as e:
-                await self._cleanup_login_client()
-                await db.set_login_state(LoginState.FAILED)
-                return f"Telegram asked us to wait {e.seconds}s. Press Login Account to try again after that."
+                await client.connect()
             except Exception as e:
-                await self._cleanup_login_client()
-                await db.set_login_state(LoginState.FAILED)
-                logger.exception("Unexpected error submitting login code")
-                return f"Login failed: {type(e).__name__}. Press Login Account to start again."
+                logger.warning("Could not connect with supplied session string: %s", type(e).__name__)
+                return f"Couldn't connect with that session string: {type(e).__name__}."
 
-            return await self._finalize_login()
-
-    async def submit_password(self, password: str) -> str:
-        async with self._login_lock:
-            if not self._login_client or not self._pending_phone:
-                await self._cleanup_login_client()
-                await db.set_login_state(LoginState.IDLE)
-                return "No login in progress. Press Login Account to start again."
             try:
-                await self._login_client.sign_in(password=password)
-            except PasswordHashInvalidError:
-                return "Incorrect 2FA password. Try again."
-            except FloodWaitError as e:
-                await self._cleanup_login_client()
-                await db.set_login_state(LoginState.FAILED)
-                return f"Telegram asked us to wait {e.seconds}s. Press Login Account to try again after that."
+                authorized = await client.is_user_authorized()
             except Exception as e:
-                await self._cleanup_login_client()
-                await db.set_login_state(LoginState.FAILED)
-                logger.exception("Unexpected error submitting 2FA password")
-                return f"Login failed: {type(e).__name__}. Press Login Account to start again."
+                await self._safe_disconnect(client)
+                return f"Couldn't verify that session: {type(e).__name__}."
 
-            return await self._finalize_login()
+            if not authorized:
+                await self._safe_disconnect(client)
+                return ("That session string is not authorized (it may be invalid, "
+                        "logged out, or revoked). Generate a fresh one with generate_session.py.")
 
-    async def _finalize_login(self) -> str:
-        try:
-            me = await self._login_client.get_me()
-            string_session = self._login_client.session.save()
-            await db.save_session_string(string_session, phone=self._pending_phone)
-        except Exception as e:
-            # Saving the session failed (e.g. transient Mongo error) - do not
-            # leave a half-finished login lying around; the owner must retry.
-            await self._cleanup_login_client()
-            await db.set_login_state(LoginState.FAILED)
-            logger.exception("Failed to finalize login (session save failed)")
-            return f"Login almost succeeded but saving the session failed: {type(e).__name__}. Please try again."
+            try:
+                me = await client.get_me()
+            except Exception as e:
+                await self._safe_disconnect(client)
+                return f"Session connected but couldn't fetch account info: {type(e).__name__}."
 
-        await db.set_connected(True)
-        self.client = self._login_client
-        self._login_client = None
-        self._phone_code_hash = None
-        self._pending_phone = None
-        logger.info("Personal account login complete: %s (id=%s)", me.username or me.first_name, me.id)
-        return "OK"
+            await db.save_session_string(client.session.save(), phone=getattr(me, "phone", None))
+            await db.set_connected(True)
+            self.client = client
+            logger.info("Personal account connected via session string: %s (id=%s)",
+                        me.username or me.first_name, me.id)
+            return "OK"
 
     async def logout(self):
         async with self._login_lock:
@@ -234,21 +160,7 @@ class AccountManager:
                     logger.exception("Error during log_out(), clearing local state anyway")
                 await self._safe_disconnect(self.client)
             self.client = None
-            await self._cleanup_login_client()
             await db.clear_session()
-
-    async def cancel_login(self):
-        async with self._login_lock:
-            await self._cleanup_login_client()
-            await db.set_login_state(LoginState.IDLE)
-
-    async def _cleanup_login_client(self):
-        """Tear down any in-progress (unauthorized) login client and state."""
-        if self._login_client:
-            await self._safe_disconnect(self._login_client)
-        self._login_client = None
-        self._phone_code_hash = None
-        self._pending_phone = None
 
 
 account_manager = AccountManager()

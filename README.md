@@ -172,21 +172,36 @@ heroku ps:scale worker=1 web=0   # web is optional; enable only if you want the 
 
 ## 8. First-run login through the bot
 
-1. Deploy, then open a DM with your bot and send `/start`.
-2. Only messages from `OWNER_ID` are accepted - anyone else gets no
-   response (point 24).
-3. Tap **📡 Sources** is greyed out until the account is connected; tap
-   the dashboard's account status, or open **Account → 🔐 Login Account**.
-4. Send the phone number (international format, e.g. `+15551234567`).
-5. Send the login code Telegram texts/sends to that account.
-6. If 2FA is enabled, send the password when prompted.
-7. On success, the session string is saved to MongoDB - you will not need
-   to log in again after restarts unless Telegram itself revokes the
-   session (point 22/23).
+**Login is done via a pasted session string, not an in-bot OTP.** Telegram's
+own anti-scam system blocks a login the instant its code is typed into any
+Telegram chat (including this bot) - "*this code was previously shared by
+your account*". That block happens on Telegram's side, so no amount of
+application code can make an in-bot phone/code/2FA flow reliable. The fix
+is to do that exchange in a plain terminal instead:
 
-OTPs and 2FA passwords are read from plain chat messages but are **never
-written to logs** (see `app/telegram_client.py` and `app/handlers/account.py`
-- the raw values only ever touch Telethon's `sign_in()` calls).
+1. On your own computer (not on Heroku, not in any Telegram chat), run:
+   ```bash
+   pip install telethon
+   python generate_session.py
+   ```
+2. It will ask for `API_ID` / `API_HASH` (same values as your `.env`), then
+   your phone number, the login code Telegram sends, and your 2FA password
+   if enabled - typed directly into the terminal.
+3. It prints a long session string. Copy the whole thing.
+4. In the bot: `/start` → **👤 Account → 🔑 Login (Paste Session String)**,
+   then paste the string as a single message. Only `OWNER_ID` can do this.
+5. The bot validates it (connects, checks `is_user_authorized()`), saves it
+   to MongoDB, and **deletes your message immediately afterward** so the
+   string doesn't linger in chat history.
+6. A `StringSession` does not expire on its own - it stays valid until you
+   explicitly log it out (**Account → 🔐 Logout Account**, or from
+   Telegram's own **Settings → Devices**) or Telegram revokes it (e.g. you
+   change your account password). You will not need to repeat this after
+   Heroku restarts (point 22/23).
+
+The session string is as sensitive as your account password - `generate_session.py`
+and the bot prompt both say so explicitly, and it is never written to logs
+anywhere in this codebase.
 
 ---
 
