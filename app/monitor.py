@@ -38,6 +38,11 @@ class Monitor:
         self._recovery_task: Optional[asyncio.Task] = None
         self._recovery_running = False
         self.on_new_live_item: Optional[Callable] = None
+        # Explicitly tracked (callback, event_builder) pairs so
+        # refresh_handlers() only ever removes handlers this class
+        # installed - never any other handler that might exist on the
+        # same client (point: don't blindly wipe all event handlers).
+        self._installed_handlers = []
 
     # ------------------------------------------------------------------
     async def install_handlers(self):
@@ -51,15 +56,23 @@ class Monitor:
         chat_ids = [s["channel_id"] for s in sources]
         self._registered_chat_ids = set(chat_ids)
 
-        @client.on(events.NewMessage(chats=chat_ids or None, incoming=True))
+        new_message_builder = events.NewMessage(chats=chat_ids or None, incoming=True)
+        album_builder = events.Album(chats=chat_ids or None)
+
         async def _on_new_message(event):
             if event.message.grouped_id is not None:
                 return  # handled by the Album handler instead
             await self._handle_new_message(event.chat_id, event.message)
 
-        @client.on(events.Album(chats=chat_ids or None))
         async def _on_album(event):
             await self._handle_album(event.chat_id, event.messages)
+
+        client.add_event_handler(_on_new_message, new_message_builder)
+        client.add_event_handler(_on_album, album_builder)
+        self._installed_handlers = [
+            (_on_new_message, new_message_builder),
+            (_on_album, album_builder),
+        ]
 
         self._handlers_installed = True
         logger.info("Live monitoring installed for %d source(s)", len(chat_ids))
@@ -69,7 +82,9 @@ class Monitor:
         client = await account_manager.get_client()
         if not client:
             return
-        client.remove_event_handler(None)
+        for callback, event_builder in self._installed_handlers:
+            client.remove_event_handler(callback, event_builder)
+        self._installed_handlers = []
         self._handlers_installed = False
         await self.install_handlers()
 

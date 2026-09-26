@@ -166,8 +166,11 @@ class Database:
     # Settings
     # ------------------------------------------------------------------
     async def get_settings(self) -> dict:
-        doc = await self.db.settings.find_one({"_id": SETTINGS_ID})
-        return doc or {}
+        # Defensive: _ensure_documents() always creates this on connect, but
+        # returning {} instead of None protects every caller that does
+        # settings.get(...) from crashing if the document is ever missing
+        # (e.g. manual DB edits, a fresh DB mid-migration).
+        return await self.db.settings.find_one({"_id": SETTINGS_ID}) or {}
 
     async def update_settings(self, update: dict):
         await self.db.settings.update_one({"_id": SETTINGS_ID}, {"$set": update})
@@ -189,8 +192,7 @@ class Database:
     # Account session
     # ------------------------------------------------------------------
     async def get_session(self) -> dict:
-        doc = await self.db.account_session.find_one({"_id": SESSION_ID})
-        return doc or {}
+        return await self.db.account_session.find_one({"_id": SESSION_ID}) or {}
 
     async def save_session_string(self, string_session: str, phone: str = None):
         update = {"string_session": string_session, "connected": True,
@@ -424,8 +426,7 @@ class Database:
     # Stats
     # ------------------------------------------------------------------
     async def get_stats(self) -> dict:
-        doc = await self.db.stats.find_one({"_id": STATS_ID})
-        return doc or {}
+        return await self.db.stats.find_one({"_id": STATS_ID}) or {}
 
     async def incr_stat(self, field: str, amount: int = 1):
         await self.db.stats.update_one({"_id": STATS_ID}, {"$inc": {field: amount}})
@@ -433,18 +434,21 @@ class Database:
     async def record_forward_success(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         stats = await self.get_stats()
+        now = datetime.now(timezone.utc)
         if stats.get("today_date") != today:
+            # A Python dict literal cannot have two "$set" keys - the second
+            # one silently overwrites the first, so today_date/today_forwarded
+            # were never actually applied. Merge into a single $set instead.
             await self.db.stats.update_one(
                 {"_id": STATS_ID},
-                {"$set": {"today_date": today, "today_forwarded": 1},
-                 "$inc": {"total_forwarded": 1},
-                 "$set": {"last_forward_at": datetime.now(timezone.utc)}},
+                {"$set": {"today_date": today, "today_forwarded": 1, "last_forward_at": now},
+                 "$inc": {"total_forwarded": 1}},
             )
         else:
             await self.db.stats.update_one(
                 {"_id": STATS_ID},
                 {"$inc": {"total_forwarded": 1, "today_forwarded": 1},
-                 "$set": {"last_forward_at": datetime.now(timezone.utc)}},
+                 "$set": {"last_forward_at": now}},
             )
 
     async def record_forward_failure(self, error: str):
@@ -457,8 +461,7 @@ class Database:
     # Dashboard
     # ------------------------------------------------------------------
     async def get_dashboard_state(self) -> dict:
-        doc = await self.db.dashboard_state.find_one({"_id": DASHBOARD_ID})
-        return doc or {}
+        return await self.db.dashboard_state.find_one({"_id": DASHBOARD_ID}) or {}
 
     async def set_dashboard_message(self, chat_id: int, message_id: int):
         await self.db.dashboard_state.update_one(

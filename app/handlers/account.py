@@ -30,28 +30,16 @@ def register(client):
     @client.on(events.CallbackQuery(pattern=b"^account:login_start$"))
     @owner_only_callback
     async def _login_start(event):
-        conversation_state.set_flow(event.chat_id, flows.LOGIN_PHONE)
-        await db.set_login_state(LoginState.PHONE)
-        await event.edit(
-            "\U0001F510 <b>Login - Step 1/3</b>\n\nSend the phone number in international "
-            "format, e.g. <code>+15551234567</code>.\n\nSend /cancel to abort.",
-            parse_mode="html", buttons=[[Button.inline("\u2B05\uFE0F Back", b"account:menu")]],
-        )
+        await _begin_phone_step(event)
 
     @client.on(events.CallbackQuery(pattern=b"^account:login_retry$"))
     @owner_only_callback
     async def _login_retry(event):
-        # A Telegram login code is single-use and a newer code invalidates an
-        # older one. Always discard the old Telethon client before retrying so
-        # the next attempt cannot reuse its phone_code_hash.
+        # Request New Code: the previous login-in-progress client (if any)
+        # was already torn down by account_manager when the code turned
+        # out invalid/expired, so this just re-opens the phone step.
         await account_manager.cancel_login()
-        conversation_state.set_flow(event.chat_id, flows.LOGIN_PHONE)
-        await db.set_login_state(LoginState.PHONE)
-        await event.edit(
-            "\U0001F510 <b>Login - Step 1/3</b>\n\nThe previous code is no longer valid. "
-            "Send the phone number again to request a fresh code.\n\nSend /cancel to abort.",
-            parse_mode="html", buttons=[[Button.inline("\u2B05\uFE0F Back", b"account:menu")]],
-        )
+        await _begin_phone_step(event)
 
     @client.on(events.CallbackQuery(pattern=b"^account:logout$"))
     @owner_only_callback
@@ -67,6 +55,7 @@ def register(client):
     @owner_only_callback
     async def _logout_do(event):
         await account_manager.logout()
+        conversation_state.clear(event.chat_id)
         await event.answer("Account logged out.", alert=True)
         await _show_menu(event)
 
@@ -79,6 +68,16 @@ def register(client):
         await _show_menu(event)
 
 
+async def _begin_phone_step(event):
+    conversation_state.set_flow(event.chat_id, flows.LOGIN_PHONE)
+    await db.set_login_state(LoginState.PHONE)
+    await event.edit(
+        "\U0001F510 <b>Login - Step 1/3</b>\n\nSend the phone number in international "
+        "format, e.g. <code>+15551234567</code>.\n\nSend /cancel to abort.",
+        parse_mode="html", buttons=[[Button.inline("\u2B05\uFE0F Back", b"account:menu")]],
+    )
+
+
 async def handle_text(client, event, flow: str) -> bool:
     """Returns True if this module consumed the message."""
     if flow == flows.LOGIN_PHONE:
@@ -88,9 +87,7 @@ async def handle_text(client, event, flow: str) -> bool:
             conversation_state.set_flow(event.chat_id, flows.LOGIN_CODE)
             await event.respond(
                 "\U0001F4F2 <b>Login - Step 2/3</b>\n\nEnter the login code Telegram just "
-                "sent you (as digits, e.g. <code>12345</code>).\n\n"
-                "Use only the newest code. If Telegram sends another code, the older code "
-                "expires immediately.\n\nSend /cancel to abort.",
+                "sent you (as digits, e.g. <code>12345</code>).\n\nSend /cancel to abort.",
                 parse_mode="html",
             )
         else:
@@ -98,15 +95,19 @@ async def handle_text(client, event, flow: str) -> bool:
         return True
 
     if flow == flows.LOGIN_CODE:
+        # Users often paste the code with spaces (e.g. "1 2 3 4 5") - strip
+        # them so a cosmetic difference never triggers a false invalid-code.
         code = event.raw_text.strip().replace(" ", "")
         # We deliberately never log the code (point 21/34/40).
         result = await account_manager.submit_code(code)
+
         if result == "OK":
             conversation_state.clear(event.chat_id)
             await event.respond("\u2705 Logged in successfully! Personal account is now connected.")
             await monitor.refresh_handlers()
             from app.handlers.start import show_dashboard
             await show_dashboard(client, event.chat_id)
+
         elif result == "2FA_REQUIRED":
             conversation_state.set_flow(event.chat_id, flows.LOGIN_2FA)
             await event.respond(
@@ -114,15 +115,24 @@ async def handle_text(client, event, flow: str) -> bool:
                 "Enter your Telegram password.\n\nSend /cancel to abort.",
                 parse_mode="html",
             )
-        elif "expired" in result.lower():
+
+        elif result in ("CODE_INVALID", "CODE_EXPIRED"):
             conversation_state.clear(event.chat_id)
+            why = "expired" if result == "CODE_EXPIRED" else "invalid"
             await event.respond(
-                f"\u274C {result}\n\nTelegram invalidates an old code when a newer "
-                "code is requested. Tap below and send the phone number again.",
+                f"\u274C That code was {why}. Telegram invalidates the whole login attempt "
+                f"once a wrong or expired code is submitted, so please request a brand new "
+                f"code and use only the newest one Telegram sends you.",
                 buttons=[[Button.inline("\U0001F504 Request New Code", b"account:login_retry")]],
             )
+
         else:
-            await event.respond(f"\u274C {result}")
+            # Any other terminal failure (FloodWait, unexpected error, etc.)
+            conversation_state.clear(event.chat_id)
+            await event.respond(
+                f"\u274C {result}",
+                buttons=[[Button.inline("\U0001F504 Request New Code", b"account:login_retry")]],
+            )
         return True
 
     if flow == flows.LOGIN_2FA:
@@ -135,8 +145,15 @@ async def handle_text(client, event, flow: str) -> bool:
             await monitor.refresh_handlers()
             from app.handlers.start import show_dashboard
             await show_dashboard(client, event.chat_id)
-        else:
+        elif result == "Incorrect 2FA password. Try again.":
+            # Stays in the same flow/step so the owner can retry the password.
             await event.respond(f"\u274C {result}")
+        else:
+            conversation_state.clear(event.chat_id)
+            await event.respond(
+                f"\u274C {result}",
+                buttons=[[Button.inline("\U0001F504 Request New Code", b"account:login_retry")]],
+            )
         return True
 
     return False
@@ -148,12 +165,13 @@ async def cancel_flow(chat_id: int, flow: str):
 
 
 async def _show_menu(event):
-    session = await db.get_session() or {}
+    session = await db.get_session()
     connected = session.get("connected", False)
     phone = session.get("phone")
     lines = ["\U0001F464 <b>Account</b>", ""]
     if connected:
-        lines.append(f"Status: \u2705 Connected{f' ({phone})' if phone else ''}")
+        phone_suffix = f" ({phone})" if phone else ""
+        lines.append(f"Status: \u2705 Connected{phone_suffix}")
         buttons = [[Button.inline("\U0001F510 Logout Account", b"account:logout")]]
     else:
         lines.append("Status: \u274C Disconnected")
