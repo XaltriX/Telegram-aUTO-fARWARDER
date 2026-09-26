@@ -72,6 +72,7 @@ class Database:
                     "media_filters": DEFAULT_MEDIA_FILTERS,
                     "paused": False,
                     "flood_wait_until": None,
+                    "hide_forward_tag": True,
                     "created_at": datetime.now(timezone.utc),
                 }
             },
@@ -181,6 +182,12 @@ class Database:
         filters[media_type] = not filters.get(media_type, True)
         await self.update_settings({"media_filters": filters})
         return filters
+
+    async def toggle_hide_forward_tag(self) -> bool:
+        settings = await self.get_settings()
+        new_value = not settings.get("hide_forward_tag", True)
+        await self.update_settings({"hide_forward_tag": new_value})
+        return new_value
 
     async def set_paused(self, paused: bool):
         await self.update_settings({"paused": paused})

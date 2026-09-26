@@ -23,7 +23,7 @@ from telethon.tl.types import Channel, Chat
 
 from app.config import config
 from app.database import db
-from app.models import JobStatus
+from app.models import JobStatus, SourceMessageGoneError
 from app.telegram_client import account_manager
 from app.utils.helpers import is_retryable_exception
 
@@ -109,7 +109,12 @@ class Scheduler:
             dest_entity = await self._get_entity(client, destination_id)
 
             message_ids = job.get("message_ids") or [job["source_message_id"]]
-            result = await client.forward_messages(dest_entity, message_ids, source_entity)
+            hide_tag = settings.get("hide_forward_tag", True)
+
+            if hide_tag:
+                result = await self._copy_messages(client, source_entity, dest_entity, message_ids)
+            else:
+                result = await client.forward_messages(dest_entity, message_ids, source_entity)
 
             forwarded_id = None
             if isinstance(result, list) and result:
@@ -163,6 +168,63 @@ class Scheduler:
                 await result
         except Exception:
             logger.exception("Error in scheduler callback")
+
+    # ------------------------------------------------------------------
+    # "Hide forward tag" mode: re-send the content as a brand new message
+    # instead of using Telegram's native forward, so the destination never
+    # shows "Forwarded from <source channel>". This re-sends the existing
+    # media object by reference (no re-download/re-upload of bytes) and
+    # copies the caption/text with its original formatting preserved via
+    # Telethon's raw `formatting_entities`.
+    # ------------------------------------------------------------------
+    async def _copy_messages(self, client, source_entity, dest_entity, message_ids: list):
+        messages = await client.get_messages(source_entity, ids=message_ids)
+        if not isinstance(messages, list):
+            messages = [messages]
+        if any(m is None for m in messages):
+            raise SourceMessageGoneError(
+                "One or more source messages no longer exist (deleted before forwarding)."
+            )
+
+        if len(messages) > 1:
+            return await self._copy_album(client, dest_entity, messages)
+        return await self._copy_single(client, dest_entity, messages[0])
+
+    @staticmethod
+    async def _copy_single(client, dest_entity, msg):
+        if msg.file:
+            return await client.send_file(
+                dest_entity, msg.media,
+                caption=msg.message or "",
+                formatting_entities=msg.entities,
+                parse_mode=None,
+            )
+        return await client.send_message(
+            dest_entity, msg.message or "",
+            formatting_entities=msg.entities,
+            parse_mode=None,
+        )
+
+    @staticmethod
+    async def _copy_album(client, dest_entity, msgs):
+        msgs = sorted(msgs, key=lambda m: m.id)
+        media_list = [m.media for m in msgs if m.media]
+        # NOTE: Telethon's album send only supports one caption string (or
+        # a list of per-item plain strings) - per-item rich formatting
+        # entities are not preserved for albums the way they are for single
+        # messages. This is a known, documented simplification.
+        captions = [m.message or "" for m in msgs if m.media]
+        return await client.send_file(dest_entity, media_list, caption=captions, parse_mode=None)
+
+
+class SourceMessageGoneError(Exception):
+    """Raised when a source message was deleted before we could copy it."""
+    pass
+
+
+class SourceMessageGoneError(Exception):
+    """Raised when a source message was deleted before we could copy it."""
+    pass
 
 
 scheduler = Scheduler()

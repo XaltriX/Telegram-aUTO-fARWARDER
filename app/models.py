@@ -26,6 +26,12 @@ class LoginState:
     FAILED = "LOGIN_FAILED"
 
 
+class SourceMessageGoneError(Exception):
+    """Raised when a source message was deleted before it could be copied
+    (used by the 'hide forward tag' copy-send path in scheduler.py)."""
+    pass
+
+
 class ScanMode:
     ALL = "ALL"
     LAST_X = "LAST_X"

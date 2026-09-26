@@ -236,7 +236,28 @@ the flow.
 
 ---
 
-## 11. Queue behavior, with examples
+## 11. Hiding the "Forwarded from" tag
+
+By default (`hide_forward_tag: True` in settings), messages are **not**
+sent using Telegram's native forward - instead, `scheduler.py::_copy_messages`
+re-sends the same media (by reference, no re-download/re-upload of bytes)
+and caption as a brand-new message, so the destination channel never shows
+"Forwarded from &lt;source&gt;". Original formatting (bold/italic/links) is
+preserved via Telethon's raw `formatting_entities` for single messages;
+albums copy captions as plain text per item (a documented simplification -
+Telegram's album send API doesn't support per-item rich entities).
+
+Toggle this anytime: **⚙️ Settings → 🙈 Hide Forward Tag**. Turning it OFF
+reverts to Telegram's native `forward_messages()` (shows the source tag,
+slightly cheaper - one API call instead of a fetch + re-send).
+
+If a source message is deleted before it can be copied, the job fails
+permanently (not retried) with a clear "source message no longer exists"
+error, visible under **📥 Queue → ❌ Failed**.
+
+---
+
+## 12. Queue behavior, with examples
 
 The **only** rule that matters: `claim_next_job()` in `database.py` always
 tries a **LIVE** job first (`sort=[("sequence", 1)]`), and only falls back
@@ -269,7 +290,7 @@ at the queue again.
 
 ---
 
-## 12. Recovery after restart
+## 13. Recovery after restart
 
 On startup (`database.py::recover_stuck_jobs`, called from
 `scheduler.run()`):
@@ -289,7 +310,7 @@ On startup (`database.py::recover_stuck_jobs`, called from
 
 ---
 
-## 13. Rate-limit / FloodWait handling
+## 14. Rate-limit / FloodWait handling
 
 `scheduler.py::_process_job` wraps every `forward_messages()` call:
 
@@ -314,7 +335,7 @@ invalid peer, etc.) go straight to `FAILED`; everything else gets up to
 
 ---
 
-## 14. Security considerations
+## 15. Security considerations
 
 - Every bot command and callback query is gated by `owner_only_message` /
   `owner_only_callback` (`app/bot.py`), which check `event.sender_id ==
@@ -336,7 +357,7 @@ invalid peer, etc.) go straight to `FAILED`; everything else gets up to
 
 ---
 
-## 15. Testing notes
+## 16. Testing notes
 
 The 20 scenarios from the spec map to these code paths and were reasoned
 through during design:
@@ -373,7 +394,7 @@ through during design:
 
 ---
 
-## 16. Troubleshooting
+## 17. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|

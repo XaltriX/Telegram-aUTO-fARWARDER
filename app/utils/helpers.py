@@ -109,6 +109,7 @@ def is_retryable_exception(exc: Exception) -> bool:
         SessionRevokedError,
         UserDeactivatedBanError,
     )
+    from app.models import SourceMessageGoneError
 
     permanent_types = (
         ChannelPrivateError,
@@ -122,6 +123,7 @@ def is_retryable_exception(exc: Exception) -> bool:
         AuthKeyUnregisteredError,
         SessionRevokedError,
         UserDeactivatedBanError,
+        SourceMessageGoneError,
     )
     if isinstance(exc, permanent_types):
         return False
