@@ -50,5 +50,5 @@ async def _show_menu(event):
     buttons.append([Button.inline(f"\U0001F648 Hide Forward Tag  {forward_state_label}",
                                    b"settings:toggle_forward_tag")])
 
-    buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:refresh")])
+    buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:home")])
     await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)

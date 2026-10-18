@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from telethon.tl.types import (
+    Message,
     DocumentAttributeAudio,
     DocumentAttributeVideo,
-    Message,
 )
 
 from app.models import MEDIA_TYPES
@@ -59,6 +59,37 @@ def get_media_type(message: Message) -> str:
         return "text"
 
     return "document"
+
+
+def is_forwardable(message) -> bool:
+    """False for service messages (pins, joins...), empty/deleted messages."""
+    if not isinstance(message, Message) or getattr(message, "action", None):
+        return False
+    return bool(message.media or (message.message or "").strip())
+
+
+def progress_bar(done: int, total: int, width: int = 10) -> str:
+    if total <= 0:
+        return "\u2591" * width
+    filled = min(width, int(width * done / total))
+    return "\u2593" * filled + "\u2591" * (width - filled)
+
+
+def source_progress_text(s: dict, prog: dict) -> str:
+    """Multi-line HTML block: bar, sent / left / total for one source."""
+    st = s.get("stats", {})
+    done = st.get("forwarded", 0)
+    p = prog.get(s["channel_id"], {})
+    left, failed = p.get("left", 0), p.get("failed", 0)
+    total = done + left + failed
+    pct = int(100 * done / total) if total else 0
+    icon = "\U0001F7E2" if s.get("enabled", True) else "\u26AA"
+    out = (f"{icon} <b>{escape_html(truncate(s['title'], 28))}</b>\n"
+           f"   {progress_bar(done, total)} {pct}%\n"
+           f"   \u2705 {done:,} sent  \u23F3 {left:,} left  \U0001F4E5 {total:,} total")
+    if failed:
+        out += f"  \u274C {failed:,}"
+    return out
 
 
 def media_type_enabled(media_type: str, settings: dict) -> bool:
@@ -110,6 +141,8 @@ def is_retryable_exception(exc: Exception) -> bool:
         UserDeactivatedBanError,
     )
     from app.models import SourceMessageGoneError
+    import telethon.errors as _te
+    restricted = getattr(_te, "ChatForwardsRestrictedError", None)
 
     permanent_types = (
         ChannelPrivateError,
@@ -124,7 +157,7 @@ def is_retryable_exception(exc: Exception) -> bool:
         SessionRevokedError,
         UserDeactivatedBanError,
         SourceMessageGoneError,
-    )
+    ) + ((restricted,) if restricted else ())
     if isinstance(exc, permanent_types):
         return False
     # Default: treat unknown errors (network, timeouts, generic RPC hiccups)

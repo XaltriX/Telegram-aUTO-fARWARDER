@@ -20,12 +20,46 @@ from typing import Any, Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, DESCENDING, IndexModel
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import BulkWriteError, DuplicateKeyError
 
 from app.config import config
 from app.models import DEFAULT_MEDIA_FILTERS, JobStatus, LoginState, Priority
 
 logger = logging.getLogger(__name__)
+
+# message-level size of a job (albums hold several messages)
+_SIZE = {"$size": {"$ifNull": ["$message_ids", [1]]}}
+_OPEN = [JobStatus.PENDING, JobStatus.PROCESSING, JobStatus.FAILED]
+
+
+def _today() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(config.TIMEZONE)
+    except Exception:
+        tz = timezone.utc
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
+
+def _fernet():
+    if not config.SESSION_ENCRYPTION_KEY:
+        return None
+    from cryptography.fernet import Fernet
+    return Fernet(config.SESSION_ENCRYPTION_KEY.encode())
+
+
+def _enc(v: str) -> str:
+    f = _fernet()
+    return "enc:" + f.encrypt(v.encode()).decode() if f else v
+
+
+def _dec(v):
+    if v and v.startswith("enc:"):
+        f = _fernet()
+        if not f:
+            raise RuntimeError("Stored session is encrypted but SESSION_ENCRYPTION_KEY is not set")
+        return f.decrypt(v[4:].encode()).decode()
+    return v
 
 SETTINGS_ID = "settings"
 SESSION_ID = "account_session"
@@ -102,7 +136,7 @@ class Database:
                     "total_forwarded": 0,
                     "total_failed": 0,
                     "today_forwarded": 0,
-                    "today_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    "today_date": _today(),
                     "last_forward_at": None,
                     "last_error": None,
                     "started_at": datetime.now(timezone.utc),
@@ -137,8 +171,10 @@ class Database:
             IndexModel([("status", ASCENDING)], name="status_idx"),
             IndexModel([("grouped_id", ASCENDING)], name="grouped_id_idx"),
         ])
-        await self.db.processed_message_ids.create_indexes([
-            IndexModel([("_id", ASCENDING)], name="pk_idx"),
+        await self.db.jobs.create_indexes([
+            IndexModel([("source_channel_id", ASCENDING), ("message_ids", ASCENDING)], name="src_msgids_idx"),
+            IndexModel([("status", ASCENDING), ("priority_type", ASCENDING), ("retry_after", ASCENDING)],
+                       name="retry_idx"),
         ])
         await self.db.counters.create_indexes([IndexModel([("_id", ASCENDING)])])
 
@@ -199,10 +235,13 @@ class Database:
     # Account session
     # ------------------------------------------------------------------
     async def get_session(self) -> dict:
-        return await self.db.account_session.find_one({"_id": SESSION_ID}) or {}
+        doc = await self.db.account_session.find_one({"_id": SESSION_ID}) or {}
+        if doc.get("string_session"):
+            doc["string_session"] = _dec(doc["string_session"])
+        return doc
 
     async def save_session_string(self, string_session: str, phone: str = None):
-        update = {"string_session": string_session, "connected": True,
+        update = {"string_session": _enc(string_session), "connected": True,
                   "login_state": LoginState.COMPLETE, "updated_at": datetime.now(timezone.utc)}
         if phone:
             update["phone"] = phone
@@ -240,6 +279,7 @@ class Database:
             "source_order": order,
             "created_at": datetime.now(timezone.utc),
             "last_seen_message_id": 0,
+            "scan_done": False,
             "last_sync_at": None,
             "scan_config": scan_config,
             "stats": {"discovered": 0, "queued": 0, "forwarded": 0, "failed": 0},
@@ -286,38 +326,34 @@ class Database:
             await self.db.jobs.delete_many(
                 {"source_channel_id": channel_id, "status": {"$in": [JobStatus.PENDING, JobStatus.FAILED]}}
             )
-            await self.db.processed_message_ids.delete_many({"source_channel_id": channel_id})
 
     # ------------------------------------------------------------------
-    # Dedup ledger
+    # Dedup: the unique (source_channel_id, source_message_id) index plus
+    # this lookup of already-queued message ids (no separate ledger, so a
+    # crash can never leave a message "reserved" without a job).
     # ------------------------------------------------------------------
-    async def reserve_message_ids(self, channel_id: int, message_ids: list, job_key: str) -> list:
-        """
-        Attempt to reserve each (channel_id, message_id) pair as 'claimed'.
-        Returns the subset of message_ids that were newly reserved (not
-        already processed). If a message id is already reserved, it is
-        skipped (duplicate protection).
-        """
-        new_ids = []
-        for mid in message_ids:
-            doc_id = f"{channel_id}:{mid}"
-            try:
-                await self.db.processed_message_ids.insert_one({
-                    "_id": doc_id,
-                    "source_channel_id": channel_id,
-                    "message_id": mid,
-                    "job_key": job_key,
-                    "reserved_at": datetime.now(timezone.utc),
-                })
-                new_ids.append(mid)
-            except DuplicateKeyError:
-                continue
-        return new_ids
+    async def existing_message_ids(self, channel_id: int, ids: list) -> set:
+        seen = set()
+        cur = self.db.jobs.find({"source_channel_id": channel_id, "message_ids": {"$in": ids}},
+                                {"message_ids": 1})
+        async for d in cur:
+            seen.update(d.get("message_ids") or [])
+        return seen
 
-    async def release_message_ids(self, channel_id: int, message_ids: list):
-        """Rollback reservation (used if job creation fails after reserving)."""
-        ids = [f"{channel_id}:{mid}" for mid in message_ids]
-        await self.db.processed_message_ids.delete_many({"_id": {"$in": ids}})
+    async def insert_jobs(self, jobs: list) -> list:
+        """Bulk insert; duplicates (unique index) are silently skipped.
+        Returns the jobs that were actually inserted."""
+        if not jobs:
+            return []
+        try:
+            await self.db.jobs.insert_many(jobs, ordered=False)
+            return jobs
+        except BulkWriteError as e:
+            errs = e.details.get("writeErrors", [])
+            if any(w.get("code") != 11000 for w in errs):
+                raise
+            bad = {w["index"] for w in errs}
+            return [j for i, j in enumerate(jobs) if i not in bad]
 
     # ------------------------------------------------------------------
     # Jobs
@@ -331,27 +367,21 @@ class Database:
             return None
 
     async def claim_next_job(self) -> Optional[dict]:
-        """
-        Atomically pick and lock the next job to process.
-        LIVE (by sequence) always takes priority over BACKLOG
-        (by source_order, then source_message_id).
-        """
+        """Atomically lock the next job. LIVE (by sequence) beats BACKLOG
+        (by source_order, message id). Jobs in retry back-off are skipped."""
         now = datetime.now(timezone.utc)
+        ready = {"status": JobStatus.PENDING,
+                 "$or": [{"retry_after": None}, {"retry_after": {"$lte": now}}]}
+        upd = {"$set": {"status": JobStatus.PROCESSING, "started_at": now}}
         job = await self.db.jobs.find_one_and_update(
-            {"status": JobStatus.PENDING, "priority_type": Priority.LIVE},
-            {"$set": {"status": JobStatus.PROCESSING, "started_at": now}},
-            sort=[("sequence", ASCENDING)],
-            return_document=True,
-        )
+            {**ready, "priority_type": Priority.LIVE}, upd,
+            sort=[("sequence", ASCENDING)], return_document=True)
         if job:
             return job
-        job = await self.db.jobs.find_one_and_update(
-            {"status": JobStatus.PENDING, "priority_type": Priority.BACKLOG},
-            {"$set": {"status": JobStatus.PROCESSING, "started_at": now}},
+        return await self.db.jobs.find_one_and_update(
+            {**ready, "priority_type": Priority.BACKLOG}, upd,
             sort=[("source_order", ASCENDING), ("source_message_id", ASCENDING)],
-            return_document=True,
-        )
-        return job
+            return_document=True)
 
     async def mark_job_done(self, job_id, forwarded_message_id: Optional[int]):
         await self.db.jobs.update_one(
@@ -363,16 +393,13 @@ class Database:
             }},
         )
 
-    async def requeue_job(self, job_id, error: str, retry_after: Optional[datetime] = None):
-        """Put a job back to PENDING (kept in its original priority queue)."""
-        update = {
-            "status": JobStatus.PENDING,
-            "last_error": error,
-            "started_at": None,
-        }
-        if retry_after:
-            update["retry_after"] = retry_after
-        await self.db.jobs.update_one({"_id": job_id}, {"$inc": {"attempts": 1}, "$set": update})
+    async def requeue_job(self, job_id, error: str, retry_after: Optional[datetime] = None,
+                          count_attempt: bool = True):
+        op = {"$set": {"status": JobStatus.PENDING, "last_error": error,
+                       "started_at": None, "retry_after": retry_after}}
+        if count_attempt:
+            op["$inc"] = {"attempts": 1}
+        await self.db.jobs.update_one({"_id": job_id}, op)
 
     async def fail_job(self, job_id, error: str):
         await self.db.jobs.update_one(
@@ -392,7 +419,8 @@ class Database:
     async def requeue_all_failed(self) -> int:
         result = await self.db.jobs.update_many(
             {"status": JobStatus.FAILED},
-            {"$set": {"status": JobStatus.PENDING, "attempts": 0, "last_error": None, "started_at": None}},
+            {"$set": {"status": JobStatus.PENDING, "attempts": 0, "last_error": None, "started_at": None,
+                      "retry_after": None}},
         )
         return result.modified_count
 
@@ -414,17 +442,31 @@ class Database:
         return result.modified_count
 
     async def queue_counts(self) -> dict:
+        """Message-level counts (an album of 5 counts as 5)."""
         pipeline = [
-            {"$match": {"status": {"$in": [JobStatus.PENDING, JobStatus.PROCESSING]}}},
-            {"$group": {"_id": "$priority_type", "count": {"$sum": 1}}},
+            {"$match": {"status": {"$in": _OPEN}}},
+            {"$group": {"_id": {"p": "$priority_type", "s": "$status"}, "n": {"$sum": _SIZE}}},
         ]
-        counts = {"LIVE": 0, "BACKLOG": 0}
-        async for row in self.db.jobs.aggregate(pipeline):
-            counts[row["_id"]] = row["count"]
-        failed = await self.db.jobs.count_documents({"status": JobStatus.FAILED})
-        counts["FAILED"] = failed
+        counts = {"LIVE": 0, "BACKLOG": 0, "FAILED": 0}
+        async for r in self.db.jobs.aggregate(pipeline):
+            if r["_id"]["s"] == JobStatus.FAILED:
+                counts["FAILED"] += r["n"]
+            else:
+                counts[r["_id"]["p"]] = counts.get(r["_id"]["p"], 0) + r["n"]
         counts["TOTAL_QUEUED"] = counts["LIVE"] + counts["BACKLOG"]
         return counts
+
+    async def source_progress(self) -> dict:
+        """{channel_id: {"left": n, "failed": n}} - 'done' comes from source stats."""
+        pipeline = [
+            {"$match": {"status": {"$in": _OPEN}}},
+            {"$group": {"_id": {"c": "$source_channel_id", "s": "$status"}, "n": {"$sum": _SIZE}}},
+        ]
+        out = {}
+        async for r in self.db.jobs.aggregate(pipeline):
+            d = out.setdefault(r["_id"]["c"], {"left": 0, "failed": 0})
+            d["failed" if r["_id"]["s"] == JobStatus.FAILED else "left"] += r["n"]
+        return out
 
     async def get_current_job(self) -> Optional[dict]:
         return await self.db.jobs.find_one({"status": JobStatus.PROCESSING})
@@ -438,25 +480,20 @@ class Database:
     async def incr_stat(self, field: str, amount: int = 1):
         await self.db.stats.update_one({"_id": STATS_ID}, {"$inc": {field: amount}})
 
-    async def record_forward_success(self):
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async def record_forward_success(self, n: int = 1):
+        today = _today()
         stats = await self.get_stats()
         now = datetime.now(timezone.utc)
         if stats.get("today_date") != today:
-            # A Python dict literal cannot have two "$set" keys - the second
-            # one silently overwrites the first, so today_date/today_forwarded
-            # were never actually applied. Merge into a single $set instead.
             await self.db.stats.update_one(
                 {"_id": STATS_ID},
-                {"$set": {"today_date": today, "today_forwarded": 1, "last_forward_at": now},
-                 "$inc": {"total_forwarded": 1}},
-            )
+                {"$set": {"today_date": today, "today_forwarded": n, "last_forward_at": now},
+                 "$inc": {"total_forwarded": n}})
         else:
             await self.db.stats.update_one(
                 {"_id": STATS_ID},
-                {"$inc": {"total_forwarded": 1, "today_forwarded": 1},
-                 "$set": {"last_forward_at": now}},
-            )
+                {"$inc": {"total_forwarded": n, "today_forwarded": n},
+                 "$set": {"last_forward_at": now}})
 
     async def record_forward_failure(self, error: str):
         await self.db.stats.update_one(

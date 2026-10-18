@@ -41,10 +41,15 @@ class Config:
 
     # --- Optional (with sane defaults) ---
     LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()
-    DASHBOARD_UPDATE_INTERVAL: int = int(os.environ.get("DASHBOARD_UPDATE_INTERVAL", "5"))
-    RECOVERY_SYNC_INTERVAL: int = int(os.environ.get("RECOVERY_SYNC_INTERVAL", "300"))
+    DASHBOARD_UPDATE_INTERVAL: int = int(os.environ.get("DASHBOARD_UPDATE_INTERVAL", "3"))
+    RECOVERY_SYNC_INTERVAL: int = int(os.environ.get("RECOVERY_SYNC_INTERVAL", "120"))
     NOTIFICATION_DELETE_SECONDS: int = int(os.environ.get("NOTIFICATION_DELETE_SECONDS", "8"))
     MONGO_DB_NAME: str = os.environ.get("MONGO_DB_NAME", "tg_forwarder")
+    TIMEZONE: str = os.environ.get("TIMEZONE", "Asia/Kolkata")
+    # Optional: Fernet key to encrypt the session string at rest in MongoDB
+    SESSION_ENCRYPTION_KEY: str = os.environ.get("SESSION_ENCRYPTION_KEY", "")
+    # Optional: if set, /health requires ?token=<value>
+    HEALTH_TOKEN: str = os.environ.get("HEALTH_TOKEN", "")
     PORT: int = int(os.environ.get("PORT", "8000"))
 
     # Backlog scan pacing (seconds between API calls while scanning history)

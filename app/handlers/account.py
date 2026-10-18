@@ -124,5 +124,5 @@ async def _show_menu(event):
     else:
         lines.append("Status: \u274C Disconnected")
         buttons = [[Button.inline("\U0001F511 Login (Paste Session String)", b"account:login_start")]]
-    buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:refresh")])
+    buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:home")])
     await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)

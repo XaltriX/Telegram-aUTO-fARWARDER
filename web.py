@@ -17,6 +17,8 @@ from app.database import db
 
 
 async def health(request):
+    if config.HEALTH_TOKEN and request.query.get("token") != config.HEALTH_TOKEN:
+        return web.json_response({"status": "forbidden"}, status=403)
     try:
         counts = await db.queue_counts()
         stats = await db.get_stats()

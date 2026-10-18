@@ -43,6 +43,7 @@ class AccountManager:
     def __init__(self):
         self.client: Optional[TelegramClient] = None  # authorized only
         self._login_lock = asyncio.Lock()
+        self._entity_cache = {}
 
     # ------------------------------------------------------------------
     def is_connected(self) -> bool:
@@ -50,6 +51,28 @@ class AccountManager:
 
     async def get_client(self) -> Optional[TelegramClient]:
         return self.client if self.is_connected() else None
+
+    async def warm_cache(self):
+        """StringSession keeps no entity cache: after every restart we must
+        load dialogs once, otherwise get_entity(-100...) raises ValueError."""
+        try:
+            await self.client.get_dialogs()
+        except Exception:
+            logger.exception("get_dialogs() failed while warming entity cache")
+
+    async def get_entity(self, ident):
+        c = self.client
+        if c is None:
+            raise RuntimeError("Personal account is not connected")
+        if ident in self._entity_cache:
+            return self._entity_cache[ident]
+        try:
+            ent = await c.get_entity(ident)
+        except ValueError:
+            await c.get_dialogs()
+            ent = await c.get_entity(ident)
+        self._entity_cache[ident] = ent
+        return ent
 
     async def bootstrap(self):
         """
@@ -75,6 +98,7 @@ class AccountManager:
                 await self._safe_disconnect(client)
                 return
             self.client = client
+            await self.warm_cache()
             await db.set_connected(True)
             await db.set_login_state(LoginState.COMPLETE)
             me = await client.get_me()
@@ -147,6 +171,8 @@ class AccountManager:
             await db.save_session_string(client.session.save(), phone=getattr(me, "phone", None))
             await db.set_connected(True)
             self.client = client
+            self._entity_cache.clear()
+            await self.warm_cache()
             logger.info("Personal account connected via session string: %s (id=%s)",
                         me.username or me.first_name, me.id)
             return "OK"
@@ -160,6 +186,7 @@ class AccountManager:
                     logger.exception("Error during log_out(), clearing local state anyway")
                 await self._safe_disconnect(self.client)
             self.client = None
+            self._entity_cache.clear()
             await db.clear_session()
 
 

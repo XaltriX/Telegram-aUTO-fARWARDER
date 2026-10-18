@@ -407,3 +407,12 @@ through during design:
 | Dashboard message disappeared | Deleted manually in the chat - next `ctl:refresh` / `/start` re-creates it (`MessageIdInvalidError` is caught and handled). |
 | Duplicate forwards after a rough restart | Should not happen - check for manual edits to the `processed_message_ids` or `jobs` collections; the unique indexes are the safety net. |
 
+
+---
+
+## 9. Optional env vars (added)
+
+- `SESSION_ENCRYPTION_KEY` - Fernet key; encrypts the session string in MongoDB.
+  Generate: `python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"`
+- `HEALTH_TOKEN` - if set, `/health?token=...` is required.
+- `TIMEZONE` - for "today" counter (default `Asia/Kolkata`).

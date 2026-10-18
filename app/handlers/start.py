@@ -17,14 +17,7 @@ def register(client):
 
 
 async def show_dashboard(bot_client, chat_id: int):
+    """Always post a fresh card at the bottom of the chat (old card is deleted)."""
     from app.dashboard import dashboard_manager
-    if dashboard_manager is None:
-        return
-    state = await db.get_dashboard_state()
-    if state and state.get("message_id"):
-        try:
-            await dashboard_manager.refresh(force=True)
-            return
-        except Exception:
-            logger.exception("Failed to refresh existing dashboard, re-initializing")
-    await dashboard_manager.initialize(chat_id)
+    if dashboard_manager is not None:
+        await dashboard_manager.initialize(chat_id)

@@ -10,6 +10,7 @@ from app.bot import conversation_state, owner_only_callback
 from app.database import db
 from app.handlers import flows
 from app.telegram_client import account_manager
+from app.utils.helpers import escape_html
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ async def _resolve_and_set(event, identifier: str):
 
     try:
         target = int(identifier) if identifier.lstrip("-").isdigit() else identifier
-        entity = await account_client.get_entity(target)
+        entity = await account_manager.get_entity(target)
     except Exception as e:
         await event.respond(f"\u274C Couldn't access that channel with the personal account: {e}")
         return
@@ -100,7 +101,10 @@ async def _resolve_and_set(event, identifier: str):
     title = getattr(entity, "title", None) or str(channel_id)
     conversation_state.clear(event.chat_id)
     await db.update_settings({"destination_channel_id": channel_id})
-    await event.respond(f"\u2705 Destination set to: <b>{title}</b>", parse_mode="html")
+    from app import dashboard as _d
+    if _d.dashboard_manager:
+        _d.dashboard_manager._dest_titles.pop(channel_id, None)
+    await event.respond(f"\u2705 Destination set to: <b>{escape_html(title)}</b>", parse_mode="html")
 
 
 async def _show_menu(event):
@@ -112,15 +116,15 @@ async def _show_menu(event):
         account_client = await account_manager.get_client()
         if account_client:
             try:
-                entity = await account_client.get_entity(dest_id)
+                entity = await account_manager.get_entity(dest_id)
                 title = getattr(entity, "title", title)
             except Exception:
                 pass
-        lines.append(f"Current: <b>{title}</b>\nID: <code>{dest_id}</code>")
+        lines.append(f"Current: <b>{escape_html(title)}</b>\nID: <code>{dest_id}</code>")
     else:
         lines.append("Not configured yet.")
     buttons = [
         [Button.inline("\U0001F3AF Set Destination", b"dest:set")],
-        [Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:refresh")],
+        [Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:home")],
     ]
     await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)

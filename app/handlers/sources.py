@@ -15,6 +15,7 @@ from app.handlers import flows
 from app.models import ScanMode
 from app.monitor import monitor
 from app.telegram_client import account_manager
+from app.utils.helpers import escape_html, source_progress_text
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +139,6 @@ async def handle_text(client, event, flow: str) -> bool:
             await event.respond("Please send a whole number, e.g. 200.")
             return True
         channel_id = conversation_state.get(event.chat_id, "pending_source_channel_id")
-        conversation_state.clear(event.chat_id)
         await _finalize_add_source(event, channel_id, {"mode": ScanMode.LAST_X, "value": value}, is_edit=False)
         return True
 
@@ -149,7 +149,6 @@ async def handle_text(client, event, flow: str) -> bool:
             await event.respond("Please use the format YYYY-MM-DD, e.g. 2026-01-01.")
             return True
         channel_id = conversation_state.get(event.chat_id, "pending_source_channel_id")
-        conversation_state.clear(event.chat_id)
         await _finalize_add_source(event, channel_id, {"mode": ScanMode.FROM_DATE, "value": dt}, is_edit=False)
         return True
 
@@ -185,7 +184,7 @@ async def _resolve_and_prompt_scan(client, event, identifier: str):
 
     try:
         target = int(identifier) if identifier.lstrip("-").isdigit() else identifier
-        entity = await account_client.get_entity(target)
+        entity = await account_manager.get_entity(target)
     except Exception as e:
         await event.respond(f"\u274C Couldn't access that channel with the personal account: {e}")
         return
@@ -196,11 +195,15 @@ async def _resolve_and_prompt_scan(client, event, identifier: str):
     channel_id = get_peer_id(entity)
 
     title = getattr(entity, "title", None) or getattr(entity, "first_name", "") or str(channel_id)
+    settings = await db.get_settings()
+    if settings.get("destination_channel_id") == channel_id:
+        await event.respond("\u274C That channel is your destination - it can't also be a source.")
+        return
     username = getattr(entity, "username", None)
 
     conversation_state.clear(event.chat_id)
     await event.respond(
-        f"\u2705 Found: <b>{title}</b>{f' (@{username})' if username else ''}\n\n"
+        f"\u2705 Found: <b>{escape_html(title)}</b>{f' (@{username})' if username else ''}\n\n"
         f"What existing content should be imported?",
         parse_mode="html",
         buttons=[
@@ -218,14 +221,15 @@ async def _finalize_add_source(event, channel_id: int, scan_config: dict, is_edi
     title = conversation_state.get(event.chat_id, "pending_title") or str(channel_id)
     username = conversation_state.get(event.chat_id, "pending_username")
     source = await db.add_source(channel_id, title, username, scan_config)
+    conversation_state.clear(event.chat_id)
     await monitor.refresh_handlers()
 
     reply = event.edit if is_edit else event.respond
     try:
-        await reply(f"\u2705 Source added: <b>{title}</b>\n\nStarting initial scan in the background\u2026",
+        await reply(f"\u2705 Source added: <b>{escape_html(title)}</b>\n\nStarting initial scan in the background\u2026",
                      parse_mode="html")
     except Exception:
-        await event.respond(f"\u2705 Source added: <b>{title}</b>\n\nStarting initial scan in the background\u2026",
+        await event.respond(f"\u2705 Source added: <b>{escape_html(title)}</b>\n\nStarting initial scan in the background\u2026",
                              parse_mode="html")
 
     import asyncio
@@ -233,15 +237,26 @@ async def _finalize_add_source(event, channel_id: int, scan_config: dict, is_edi
 
 
 async def _run_initial_scan(source: dict):
-    try:
-        queued = await monitor.scan_initial_backlog(source)
-        logger.info("Initial scan for %s queued %d job(s)", source["channel_id"], queued)
-    except Exception:
-        logger.exception("Initial scan failed for source %s", source["channel_id"])
+    import asyncio
+    for attempt in range(1, 4):
+        try:
+            queued = await monitor.scan_initial_backlog(source)
+            logger.info("Initial scan for %s queued %d message(s)", source["channel_id"], queued)
+            return
+        except Exception:
+            logger.exception("Initial scan failed for %s (attempt %d/3)", source["channel_id"], attempt)
+            await asyncio.sleep(5 * attempt)
+    from app.dashboard import dashboard_manager
+    state = await db.get_dashboard_state()
+    if dashboard_manager and state.get("chat_id"):
+        await dashboard_manager.notify(
+            state["chat_id"],
+            f"\u26A0\uFE0F Initial scan failed for <b>{escape_html(source['title'])}</b>. Remove and re-add the source.")
 
 
 async def _show_list(event, page: int):
     sources = await db.list_sources()
+    prog = await db.source_progress()
     total = len(sources)
     start = page * PAGE_SIZE
     page_items = sources[start:start + PAGE_SIZE]
@@ -251,9 +266,9 @@ async def _show_list(event, page: int):
     if not page_items:
         lines.append("No sources configured yet.")
     for s in page_items:
+        lines.append(source_progress_text(s, prog))
+        lines.append("")
         status = "\U0001F7E2" if s.get("enabled") else "\u26AA"
-        lines.append(f"{status} {s['title']}  \u2014  queued {s['stats'].get('queued', 0)}, "
-                      f"fwd {s['stats'].get('forwarded', 0)}")
         buttons.append([Button.inline(f"{status} {s['title'][:28]}", f"src:view:{s['channel_id']}".encode())])
 
     nav = []
@@ -263,10 +278,8 @@ async def _show_list(event, page: int):
         nav.append(Button.inline("\u27A1\uFE0F", f"src:page:{page+1}".encode()))
     if nav:
         buttons.append(nav)
-
     buttons.append([Button.inline("\u2795 Add Source", b"src:add")])
-    buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:refresh")])
-
+    buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:home")])
     await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)
 
 
@@ -276,23 +289,18 @@ async def _show_detail(event, channel_id: int):
         await event.answer("Source no longer exists.", alert=True)
         await _show_list(event, page=0)
         return
-    stats = s.get("stats", {})
-    status = "Enabled \U0001F7E2" if s.get("enabled") else "Disabled \u26AA"
+    prog = await db.source_progress()
+    st = s.get("stats", {})
+    scan_state = "done" if s.get("scan_done", True) else "running..."
     lines = [
-        f"\U0001F4E1 <b>{s['title']}</b>",
-        f"ID: <code>{s['channel_id']}</code>",
-        f"Status: {status}",
-        f"Order: #{s['source_order']}",
-        "",
-        f"Discovered: {stats.get('discovered', 0)}",
-        f"Queued: {stats.get('queued', 0)}",
-        f"Forwarded: {stats.get('forwarded', 0)}",
-        f"Failed: {stats.get('failed', 0)}",
+        source_progress_text(s, prog), "",
+        f"ID: <code>{s['channel_id']}</code>   Order: #{s['source_order']}",
+        f"Discovered: {st.get('discovered', 0):,}   Failed: {st.get('failed', 0):,}",
+        f"Initial scan: {scan_state}",
         f"Last sync: {s.get('last_sync_at') or 'never'}",
     ]
     buttons = [
-        [Button.inline("\u26AA Disable" if s.get("enabled") else "\U0001F7E2 Enable",
-                        f"src:toggle:{channel_id}".encode())],
+        [Button.inline("\u26AA Disable" if s.get("enabled") else "\U0001F7E2 Enable", f"src:toggle:{channel_id}".encode())],
         [Button.inline("\U0001F5D1 Remove", f"src:remove:{channel_id}".encode())],
         [Button.inline("\u2B05\uFE0F Back", b"src:menu")],
     ]

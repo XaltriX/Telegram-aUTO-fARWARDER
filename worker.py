@@ -7,8 +7,8 @@ Main worker entrypoint - runs:
   - the throttled dashboard refresh loop
 
 This is the ONLY process that performs forwarding. If a `web` dyno is also
-declared in the Procfile, it must run app/web.py's lightweight health
-endpoint ONLY - never a second copy of this file (point 32/36).
+declared in the Procfile, it must run web.py's lightweight health
+endpoint ONLY - never a second copy of this file .
 """
 import asyncio
 import logging
@@ -61,55 +61,35 @@ class Application:
         await asyncio.gather(*self._tasks)
 
     def _wire_notifications(self):
-        async def on_started(job):
-            pass  # dashboard already reflects "current job" via DB read
+        """No per-file chat spam: the live card shows progress. Only rare
+        events (terminal failures, rate limits) produce a temporary notice."""
+        async def _notice(text):
+            dm = dashboard_module.dashboard_manager
+            state = await db.get_dashboard_state()
+            if dm and state.get("chat_id"):
+                await dm.notify(state["chat_id"], text)
+
+        async def _refresh(force=False):
+            dm = dashboard_module.dashboard_manager
+            if dm:
+                await dm.refresh(force=force)
 
         async def on_done(job, forwarded_id):
-            from app.dashboard import dashboard_manager
-            state = await db.get_dashboard_state()
-            if state and state.get("chat_id"):
-                await dashboard_manager.notify(
-                    state["chat_id"],
-                    f"\u2705 <b>FORWARDED</b>\n\U0001F4E6 msg #{job['source_message_id']} ({job['media_type']})",
-                )
-            await dashboard_manager.refresh()
+            await _refresh()
 
         async def on_failed(job, error):
-            from app.dashboard import dashboard_manager
-            state = await db.get_dashboard_state()
-            if state and state.get("chat_id"):
-                await dashboard_manager.notify(
-                    state["chat_id"],
-                    f"\u26A0\uFE0F <b>RETRY/FAILED</b>\n\U0001F4E6 msg #{job['source_message_id']}\n{error[:150]}",
-                )
-            await dashboard_manager.refresh()
+            await _notice(f"\u26A0\uFE0F <b>FAILED</b> msg #{job['source_message_id']}\n{error[:150]}")
+            await _refresh()
 
         async def on_flood_wait(job, seconds):
-            from app.dashboard import dashboard_manager
-            state = await db.get_dashboard_state()
-            if state and state.get("chat_id"):
-                await dashboard_manager.notify(
-                    state["chat_id"],
-                    f"\U0001F6A6 <b>RATE LIMITED</b>\nWaiting {seconds}s as requested by Telegram\u2026",
-                )
-            await dashboard_manager.refresh(force=True)
+            await _notice(f"\U0001F6A6 <b>RATE LIMITED</b> \u2014 waiting {seconds}s")
+            await _refresh(force=True)
 
-        async def on_new_live_item(source, message, job):
-            from app.dashboard import dashboard_manager
-            from app.utils.helpers import get_filename
-            state = await db.get_dashboard_state()
-            if state and state.get("chat_id"):
-                await dashboard_manager.notify(
-                    state["chat_id"],
-                    f"\U0001F6A8 <b>NEW FILE</b>\n\U0001F4E1 {source['title']}\n"
-                    f"\U0001F4E6 {get_filename(message)}\n\u26A1 Added to live queue",
-                )
-
-        scheduler.on_job_started = on_started
+        scheduler.on_job_started = lambda job: _refresh()
         scheduler.on_job_done = on_done
         scheduler.on_job_failed = on_failed
         scheduler.on_flood_wait = on_flood_wait
-        monitor.on_new_live_item = on_new_live_item
+        monitor.on_queue_change = _refresh
 
     async def shutdown(self):
         if self._shutting_down:

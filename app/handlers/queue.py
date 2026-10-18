@@ -36,12 +36,13 @@ def register(client):
         if dashboard_manager:
             await dashboard_manager.refresh(force=True)
 
-    @client.on(events.CallbackQuery(pattern=b"^ctl:refresh$"))
+
+    @client.on(events.CallbackQuery(pattern=b"^ctl:(refresh|home)$"))
     @owner_only_callback
     async def _refresh(event):
-        from app.handlers.start import show_dashboard
-        await event.delete()
-        await show_dashboard(client, event.chat_id)
+        from app.dashboard import dashboard_manager
+        await dashboard_manager.show_home(event)
+        await event.answer()
 
 
 async def _show_menu(event):
@@ -55,7 +56,7 @@ async def _show_menu(event):
     ]
     buttons = [
         [Button.inline("\u274C Failed", b"queue:failed")],
-        [Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:refresh")],
+        [Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:home")],
     ]
     await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)
 

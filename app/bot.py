@@ -62,6 +62,9 @@ def owner_only_callback(handler):
         if event.sender_id != config.OWNER_ID:
             await event.answer("Not authorized.", alert=True)
             return
+        from app import dashboard as _d
+        if _d.dashboard_manager and event.data not in (b"ctl:home", b"ctl:refresh", b"ctl:toggle_pause"):
+            _d.dashboard_manager.set_view("menu")  # pause live card edits while a menu is open
         return await handler(event)
     return wrapper
 
@@ -94,9 +97,13 @@ def register_handlers(client: TelegramClient):
     h_settings.register(client)
     h_stats.register(client)
 
-    @client.on(events.NewMessage(pattern=r"^/(start|dashboard)$"))
+    @client.on(events.NewMessage(pattern=r"^/(start|dashboard)(@\w+)?(\s.*)?$"))
     @owner_only_message
     async def _start(event):
+        try:
+            await event.delete()
+        except Exception:
+            pass
         await h_start.show_dashboard(client, event.chat_id)
 
     @client.on(events.NewMessage(pattern=r"^/cancel$"))
