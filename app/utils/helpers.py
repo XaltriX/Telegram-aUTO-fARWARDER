@@ -2,6 +2,7 @@
 Misc small helpers shared across modules.
 """
 import asyncio
+import hashlib
 import html
 import time
 from datetime import datetime, timezone
@@ -59,6 +60,34 @@ def get_media_type(message: Message) -> str:
         return "text"
 
     return "document"
+
+
+def fingerprints(m) -> list:
+    """Identity keys of a message's content, used for duplicate detection.
+    d:/p: = Telegram document/photo id (stays the same when a file is re-sent by
+    reference), n:/s: = name+size / size+duration fallback, t: = text hash."""
+    if not isinstance(m, Message) or getattr(m, "action", None):
+        return []
+    fps = []
+    try:
+        if m.document:
+            d = m.document
+            fps.append(f"d:{d.id}")
+            f = m.file
+            name = (f.name or "").strip().lower() if f else ""
+            if name:
+                fps.append(f"n:{name}|{d.size}")
+            elif f and f.duration:
+                fps.append(f"s:{d.size}|{f.duration}")
+        elif m.photo and not m.web_preview:
+            fps.append(f"p:{m.photo.id}")
+        elif not m.media or m.web_preview:
+            text = (m.message or "").strip()
+            if len(text) >= 20:
+                fps.append("t:" + hashlib.sha1(text.lower().encode()).hexdigest()[:20])
+    except Exception:
+        pass
+    return fps
 
 
 def is_forwardable(message) -> bool:
@@ -147,6 +176,15 @@ def source_progress_text(s: dict, prog: dict, active: bool = False) -> str:
            f"   \u2705 {done:,} sent  \u23F3 {left:,} left  \U0001F4E5 {total:,} total")
     if failed:
         out += f"  \u274C {failed:,}"
+    if st.get("skipped"):
+        out += f"\n   \u267B\uFE0F {st['skipped']:,} duplicates skipped"
+    if s.get("scan_done") is False:
+        sp = s.get("scan_progress") or {}
+        if sp.get("state") == "scanning" and sp.get("total"):
+            out += (f"\n   \U0001F50D scanning {progress_bar(sp['scanned'], sp['total'])} "
+                    f"{int(100 * sp['scanned'] / sp['total'])}% ({sp['scanned']:,}/{sp['total']:,})")
+        else:
+            out += "\n   \u23F3 waiting for destination index\u2026"
     return out
 
 

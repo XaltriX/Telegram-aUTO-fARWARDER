@@ -22,6 +22,13 @@ def register(client):
             await db.toggle_media_filter(media_type)
         await _show_menu(event)
 
+    @client.on(events.CallbackQuery(pattern=b"^settings:toggle_dedupe$"))
+    @owner_only_callback
+    async def _toggle_dedupe(event):
+        s = await db.get_settings()
+        await db.update_settings({"dedupe": not s.get("dedupe", True)})
+        await _show_menu(event)
+
     @client.on(events.CallbackQuery(pattern=b"^settings:toggle_forward_tag$"))
     @owner_only_callback
     async def _toggle_forward_tag(event):
@@ -50,5 +57,11 @@ async def _show_menu(event):
     buttons.append([Button.inline(f"\U0001F648 Hide Forward Tag  {forward_state_label}",
                                    b"settings:toggle_forward_tag")])
 
+    dedupe = settings.get("dedupe", True)
+    lines += ["", "<b>Skip Duplicates</b> \u2014 a file already in the destination (or queued from any "
+              "source) is never sent twice."]
+    dedupe_label = "\u2705 ON" if dedupe else "\u26AB OFF"
+    buttons.append([Button.inline(f"\u267B\uFE0F Skip Duplicates  {dedupe_label}",
+                                   b"settings:toggle_dedupe")])
     buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:home")])
     await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)

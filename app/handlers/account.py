@@ -100,6 +100,8 @@ async def handle_text(client, event, flow: str) -> bool:
         import asyncio
         from app.handlers.sources import resume_scans
         asyncio.create_task(resume_scans())
+        from app.dest_index import dest_indexer
+        asyncio.create_task(dest_indexer.ensure())
     else:
         conversation_state.clear(event.chat_id)
         await event.respond(

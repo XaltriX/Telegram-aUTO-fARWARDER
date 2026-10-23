@@ -48,6 +48,22 @@ def register(client):
         conversation_state.set(event.chat_id, "awaiting_forward_for", "destination")
         await event.edit("\U0001F4E8 Forward any message from the destination channel here.\n\nSend /cancel to abort.")
 
+    @client.on(events.CallbackQuery(pattern=b"^dest:reindex$"))
+    @owner_only_callback
+    async def _reindex(event):
+        from app.dest_index import dest_indexer
+        await dest_indexer.reindex()
+        await event.answer("Indexing destination\u2026")
+        await _show_menu(event)
+
+    @client.on(events.CallbackQuery(pattern=b"^dest:skip_index$"))
+    @owner_only_callback
+    async def _skip_index(event):
+        from app.dest_index import dest_indexer
+        await dest_indexer.skip()
+        await event.answer("Indexing skipped - duplicates will NOT be filtered.", alert=True)
+        await _show_menu(event)
+
 
 async def handle_text(client, event, flow: str) -> bool:
     if flow == flows.SET_DESTINATION_ID:
@@ -101,6 +117,8 @@ async def _resolve_and_set(event, identifier: str):
     title = getattr(entity, "title", None) or str(channel_id)
     conversation_state.clear(event.chat_id)
     await db.update_settings({"destination_channel_id": channel_id})
+    from app.dest_index import dest_indexer
+    await dest_indexer.ensure()  # start scanning the new destination for existing files
     from app import dashboard as _d
     if _d.dashboard_manager:
         _d.dashboard_manager._dest_titles.pop(channel_id, None)
@@ -108,23 +126,36 @@ async def _resolve_and_set(event, identifier: str):
 
 
 async def _show_menu(event):
+    from app.utils.helpers import progress_bar
     settings = await db.get_settings()
     dest_id = settings.get("destination_channel_id")
     lines = ["\U0001F3AF <b>Destination</b>", ""]
+    buttons = []
     if dest_id:
         title = str(dest_id)
-        account_client = await account_manager.get_client()
-        if account_client:
+        if await account_manager.get_client():
             try:
-                entity = await account_manager.get_entity(dest_id)
-                title = getattr(entity, "title", title)
+                title = getattr(await account_manager.get_entity(dest_id), "title", title)
             except Exception:
                 pass
         lines.append(f"Current: <b>{escape_html(title)}</b>\nID: <code>{dest_id}</code>")
+        di = settings.get("dest_index") or {}
+        state = di.get("state") if di.get("dest_id") == dest_id else None
+        lines.append("")
+        if state == "running":
+            sc, tot = di.get("scanned", 0), max(di.get("total", 0), 1)
+            lines.append(f"\U0001F50D <b>Indexing</b> {min(100, int(100 * sc / tot))}%\n"
+                         f"<code>{progress_bar(sc, tot, 16)}</code>\n{sc:,}/{tot:,} messages \u00B7 {di.get('files', 0):,} files")
+            buttons.append([Button.inline("\u23ED Skip indexing", b"dest:skip_index")])
+        elif state == "done":
+            lines.append(f"\u2705 Indexed {di.get('files', 0):,} files \u2014 duplicates are skipped."
+                         + (" (indexing was skipped)" if di.get("skipped") else ""))
+        else:
+            lines.append("\U0001F50D Index not ready yet (starting / retrying)\u2026")
+        buttons.append([Button.inline("\U0001F50D Re-index destination", b"dest:reindex"),
+                        Button.inline("\U0001F504 Refresh", b"dest:menu")])
     else:
         lines.append("Not configured yet.")
-    buttons = [
-        [Button.inline("\U0001F3AF Set Destination", b"dest:set")],
-        [Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:home")],
-    ]
+    buttons.append([Button.inline("\U0001F3AF Set Destination", b"dest:set")])
+    buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:home")])
     await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)

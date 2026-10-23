@@ -131,6 +131,7 @@ class Scheduler:
                 "size": job.get("file_size") or 0, "at": datetime.now(timezone.utc),
             }
             await db.record_forward_success(len(message_ids), entry)
+            await db.add_dest_fps(destination_id, job.get("fps") or [], forwarded_id)
             self._consec_fail = 0
             await db.incr_source_stat(job["source_channel_id"], "forwarded", len(message_ids))
 

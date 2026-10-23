@@ -77,6 +77,25 @@ class DashboardManager:
                 return str(dest_id)
         return self._dest_titles[dest_id]
 
+    @staticmethod
+    def _index_lines(settings, stats):
+        dest = settings.get("destination_channel_id")
+        if not dest:
+            return []
+        di = settings.get("dest_index") or {}
+        state = di.get("state") if di.get("dest_id") == dest else None
+        if state == "running":
+            sc, tot = di.get("scanned", 0), max(di.get("total", 0), 1)
+            return [f"\U0001F50D <b>INDEXING DESTINATION  {min(100, int(100 * sc / tot))}%</b>",
+                    f"<code>{progress_bar(sc, tot, 16)}</code>",
+                    f"{sc:,}/{tot:,} messages \u00B7 {di.get('files', 0):,} files found \u00B7 sources wait for this"]
+        if state == "error":
+            return ["\u26A0\uFE0F destination index failed \u2014 retrying shortly"]
+        if state != "done":
+            return ["\U0001F50D destination index: starting\u2026"]
+        return [f"\u267B\uFE0F duplicates skipped <b>{stats.get('total_skipped', 0):,}</b> \u00B7 "
+                f"\U0001F5C2 {di.get('files', 0):,} files indexed" + (" (skipped)" if di.get("skipped") else "")]
+
     async def build(self):
         settings, session, stats, (counts, prog), current, sources = await asyncio.gather(
             db.get_settings(), db.get_session(), db.get_stats(), db.queue_snapshot(),
@@ -106,6 +125,8 @@ class DashboardManager:
             f"\U0001F4E6 backlog {counts['BACKLOG']:,}",
             LINE,
         ]
+
+        head[-1:-1] = self._index_lines(settings, stats)
 
         # ---- now forwarding
         active_cid = None

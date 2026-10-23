@@ -19,6 +19,7 @@ from app.database import db
 from app.dashboard import DashboardManager
 import app.dashboard as dashboard_module
 from app.monitor import monitor
+from app.dest_index import dest_indexer
 from app.scheduler import scheduler
 from app.telegram_client import account_manager
 from app.utils.logging import setup_logging
@@ -103,6 +104,7 @@ class Application:
         scheduler.on_flood_wait = on_flood_wait
         scheduler.on_auto_pause = on_auto_pause
         monitor.on_queue_change = _refresh
+        dest_indexer.on_change = _refresh
 
     async def shutdown(self):
         if self._shutting_down:

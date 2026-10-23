@@ -177,6 +177,7 @@ class Database:
             IndexModel([("source_channel_id", ASCENDING), ("message_ids", ASCENDING)], name="src_msgids_idx"),
             IndexModel([("status", ASCENDING), ("priority_type", ASCENDING), ("retry_after", ASCENDING)],
                        name="retry_idx"),
+            IndexModel([("fps", ASCENDING)], name="fps_idx"),
         ])
         await self.db.counters.create_indexes([IndexModel([("_id", ASCENDING)])])
 
@@ -341,6 +342,45 @@ class Database:
         async for d in cur:
             seen.update(d.get("message_ids") or [])
         return seen
+
+    async def insert_ignore_dups(self, coll, docs: list):
+        if not docs:
+            return
+        try:
+            await coll.insert_many(docs, ordered=False)
+        except BulkWriteError as e:
+            if any(w.get("code") != 11000 for w in e.details.get("writeErrors", [])):
+                raise
+
+    async def indexed(self, dest, fps: list) -> set:
+        """Which of these fingerprints already exist in the destination."""
+        out = set()
+        for i in range(0, len(fps), 500):
+            chunk = [f"{dest}|{f}" for f in fps[i:i + 500]]
+            async for d in self.db.dest_index.find({"_id": {"$in": chunk}}, {"_id": 1}):
+                out.add(d["_id"].split("|", 1)[1])
+        return out
+
+    async def open_job_fps(self, fps: list) -> set:
+        """Fingerprints already waiting in the queue (any source)."""
+        out = set()
+        for i in range(0, len(fps), 500):
+            cur = self.db.jobs.find({"fps": {"$in": fps[i:i + 500]},
+                                     "status": {"$in": [JobStatus.PENDING, JobStatus.PROCESSING]}},
+                                    {"fps": 1})
+            async for d in cur:
+                out.update(d.get("fps") or [])
+        return out
+
+    async def add_dest_fps(self, dest, fps: list, msg_id):
+        await self.insert_ignore_dups(
+            self.db.dest_index, [{"_id": f"{dest}|{f}", "msg_id": msg_id} for f in set(fps)])
+
+    async def dest_index_ready(self) -> bool:
+        s = await self.get_settings()
+        di = s.get("dest_index") or {}
+        return bool(s.get("destination_channel_id")) and di.get("state") == "done" \
+            and di.get("dest_id") == s.get("destination_channel_id")
 
     async def insert_jobs(self, jobs: list) -> list:
         """Bulk insert; duplicates (unique index) are silently skipped.

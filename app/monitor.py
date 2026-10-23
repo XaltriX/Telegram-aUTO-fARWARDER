@@ -70,7 +70,7 @@ class Monitor:
             source = await db.get_source(chat_id)
             if not source or not source.get("enabled"):
                 return
-            jobs = await queue_manager.enqueue_batch(source, messages, Priority.LIVE)
+            jobs, _ = await queue_manager.enqueue_batch(source, messages, Priority.LIVE)
             if jobs:
                 self._changed()
         except Exception:
@@ -90,8 +90,10 @@ class Monitor:
     # ------------------------------------------------------------------
     async def recovery_loop(self):
         await asyncio.sleep(15)  # first catch-up shortly after start
+        from app.dest_index import dest_indexer
         while True:
             try:
+                await dest_indexer.ensure()
                 await self.run_recovery_sync()
             except asyncio.CancelledError:
                 raise
@@ -127,6 +129,8 @@ class Monitor:
 
     async def _sync_source(self, client, source: dict):
         cid = source["channel_id"]
+        if not await db.dest_index_ready():
+            return  # duplicates can't be filtered until the destination is indexed
         min_id = source.get("last_seen_message_id", 0)
         entity = await account_manager.get_entity(cid)
 
@@ -147,7 +151,7 @@ class Monitor:
                 trimmed = [m for m in batch if m.grouped_id != gid]
                 batch = trimmed or batch
             max_seen = max(m.id for m in batch)
-            jobs = await queue_manager.enqueue_batch(source, batch, Priority.BACKLOG)
+            jobs, _ = await queue_manager.enqueue_batch(source, batch, Priority.BACKLOG)
             total += sum(len(j["message_ids"]) for j in jobs)
             await db.update_last_seen(cid, max_seen)
             min_id = max_seen
@@ -162,39 +166,55 @@ class Monitor:
     # ------------------------------------------------------------------
     # Initial scan for a newly added source
     # ------------------------------------------------------------------
-    async def _flush(self, source, buf, final):
+    async def _set_scan(self, cid, state, scanned=0, total=0, skipped=0):
+        await db.update_source(cid, {"scan_progress": {
+            "state": state, "scanned": scanned, "total": total, "skipped": skipped}})
+        self._changed()
+
+    async def _flush(self, source, buf, final, acc):
         keep = []
         if not final and buf and buf[-1].grouped_id is not None:
             gid = buf[-1].grouped_id
             keep = [m for m in buf if m.grouped_id == gid]
             buf = [m for m in buf if m.grouped_id != gid]
-        n = 0
         if buf:
-            jobs = await queue_manager.enqueue_batch(source, buf, Priority.BACKLOG)
-            n = sum(len(j["message_ids"]) for j in jobs)
+            jobs, sk = await queue_manager.enqueue_batch(source, buf, Priority.BACKLOG)
+            acc["queued"] += sum(len(j["message_ids"]) for j in jobs)
+            acc["skipped"] += sk
             await db.update_last_seen(source["channel_id"], max(m.id for m in buf))
-            self._changed()
-        return keep, n
+        await self._set_scan(source["channel_id"], "scanning", acc["scanned"], acc["total"], acc["skipped"])
+        return keep
 
     async def scan_initial_backlog(self, source: dict) -> int:
+        from app.dest_index import dest_indexer
         client = await account_manager.get_client()
         if not client:
             raise RuntimeError("Account not connected")
         cid = source["channel_id"]
         sc = source.get("scan_config") or {"mode": ScanMode.NEW_ONLY}
         mode = sc.get("mode", ScanMode.NEW_ONLY)
+
+        # wait until the destination is indexed, so existing files are skipped
+        while not await db.dest_index_ready():
+            await self._set_scan(cid, "waiting")
+            await dest_indexer.ensure()
+            await asyncio.sleep(5)
+
         entity = await account_manager.get_entity(cid)
-        queued = 0
+        total = (await client.get_messages(entity, limit=0)).total or 0
+        acc = {"scanned": 0, "total": total, "queued": 0, "skipped": 0}
 
         if mode == ScanMode.NEW_ONLY:
             await db.update_last_seen(cid, await self._top_id(entity))
         elif mode == ScanMode.LAST_X:
-            msgs = [m async for m in client.iter_messages(entity, limit=int(sc.get("value", 100)))]
+            limit = int(sc.get("value", 100))
+            acc["total"] = min(total, limit)
+            msgs = [m async for m in client.iter_messages(entity, limit=limit)]
             msgs.sort(key=lambda m: m.id)
             for i in range(0, len(msgs), config.SCAN_BATCH_SIZE):
                 chunk = msgs[i:i + config.SCAN_BATCH_SIZE]
-                _, n = await self._flush(source, chunk, final=True)
-                queued += n
+                acc["scanned"] += len(chunk)
+                await self._flush(source, chunk, True, acc)
         else:  # ALL / FROM_DATE - stream oldest -> newest
             kwargs = {"reverse": True}
             if mode == ScanMode.FROM_DATE:
@@ -205,21 +225,21 @@ class Monitor:
                     async for m in client.iter_messages(entity, **kwargs):
                         buf.append(m)
                         last_id = m.id
+                        acc["scanned"] += 1
                         if len(buf) >= config.SCAN_BATCH_SIZE:
-                            buf, n = await self._flush(source, buf, final=False)
-                            queued += n
+                            buf = await self._flush(source, buf, False, acc)
                             await asyncio.sleep(config.SCAN_BATCH_DELAY)
                     break
                 except FloodWaitError as e:
                     logger.warning("FloodWait during scan: %ss", e.seconds)
                     await asyncio.sleep(e.seconds)
                     kwargs = {"reverse": True, "min_id": last_id}  # resume
-            _, n = await self._flush(source, buf, final=True)
-            queued += n
+            await self._flush(source, buf, True, acc)
 
+        await self._set_scan(cid, "done", acc["scanned"], acc["total"], acc["skipped"])
         await db.update_source(cid, {"scan_done": True})
         await db.touch_sync(cid)
-        return queued
+        return acc["queued"]
 
 
 monitor = Monitor()
