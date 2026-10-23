@@ -16,13 +16,15 @@ from telethon.errors import MessageIdInvalidError, MessageNotModifiedError
 from app.config import config
 from app.database import db
 from app.telegram_client import account_manager
-from app.utils.helpers import delete_after, escape_html, source_progress_text, truncate
+from app.utils.helpers import (TYPE_ICON, delete_after, escape_html, human_size, message_link,
+                               progress_bar, source_progress_text, time_ago, truncate)
 
 logger = logging.getLogger(__name__)
 
 MENU_IDLE = 90          # seconds a menu may stay open before card returns home
 MIN_EDIT_GAP = 2.0      # seconds between edits (Telegram edit limits)
-CARD_SOURCES = 8        # sources shown on the card itself
+CARD_SOURCES = 6        # sources shown on the card itself
+LINE = "\u2501" * 18
 
 
 def _fmt_uptime(started_at) -> str:
@@ -52,14 +54,17 @@ class DashboardManager:
         self._view_since = time.monotonic()
 
     # ---------------- rendering
-    def _buttons(self, paused: bool):
-        return [
+    def _buttons(self, paused: bool, failed: int = 0):
+        rows = [
             [Button.inline("\U0001F4E1 Sources", b"src:menu"), Button.inline("\U0001F4E5 Queue", b"queue:menu")],
             [Button.inline("\U0001F3AF Destination", b"dest:menu"), Button.inline("\U0001F464 Account", b"account:menu")],
-            [Button.inline("\U0001F4CA Stats", b"stats:menu"), Button.inline("⚙️ Settings", b"settings:menu")],
-            [Button.inline("▶️ Resume" if paused else "⏸ Pause", b"ctl:toggle_pause"),
-             Button.inline("\U0001F504 Refresh", b"ctl:home")],
+            [Button.inline("\U0001F4CA Stats", b"stats:menu"), Button.inline("\u2699\uFE0F Settings", b"settings:menu")],
         ]
+        if failed:
+            rows.append([Button.inline(f"\U0001F501 Retry {failed:,} failed", b"queue:retry_all")])
+        rows.append([Button.inline("\u25B6\uFE0F Resume" if paused else "\u23F8 Pause", b"ctl:toggle_pause"),
+                     Button.inline("\U0001F504 Refresh", b"ctl:home")])
+        return rows
 
     async def _dest_title(self, dest_id) -> str:
         if not dest_id:
@@ -73,45 +78,88 @@ class DashboardManager:
         return self._dest_titles[dest_id]
 
     async def build(self):
-        settings, session, stats, counts, current, sources, prog = await asyncio.gather(
-            db.get_settings(), db.get_session(), db.get_stats(), db.queue_counts(),
-            db.get_current_job(), db.list_sources(), db.source_progress())
+        settings, session, stats, (counts, prog), current, sources = await asyncio.gather(
+            db.get_settings(), db.get_session(), db.get_stats(), db.queue_snapshot(),
+            db.get_current_job(), db.list_sources())
+        by_id = {s["channel_id"]: s for s in sources}
 
         paused = settings.get("paused", False)
         flood = settings.get("flood_wait_until")
         wait = int(flood - time.time()) if flood else 0
-        rate = f"\U0001F6A6 LIMITED {wait}s" if wait > 0 else "NORMAL"
-        acct = "✅ connected" if session.get("connected") else "❌ disconnected"
-        dest = escape_html(truncate(await self._dest_title(settings.get("destination_channel_id")), 30))
+        acct = "connected" if session.get("connected") else "\u274C DISCONNECTED"
+        dest = escape_html(truncate(await self._dest_title(settings.get("destination_channel_id")), 28))
 
-        now_line = "idle"
-        if current:
-            src = next((s for s in sources if s["channel_id"] == current["source_channel_id"]), None)
-            name = escape_html(truncate(src["title"], 24)) if src else str(current["source_channel_id"])
-            n = len(current.get("message_ids") or [1])
-            now_line = f"{name} › #{current['source_message_id']} ({current['media_type']}{f' x{n}' if n > 1 else ''})"
+        sent = stats.get("total_forwarded", 0)
+        left, failed = counts["TOTAL_QUEUED"], counts["FAILED"]
+        total = sent + left + failed
+        pct = int(100 * sent / total) if total else 0
+        status = "\U0001F7E1 PAUSED" if paused else ("\U0001F6A6 RATE LIMITED %ds" % wait if wait > 0 else "\U0001F7E2 ONLINE")
 
-        lines = [
-            "⚡ <b>TG FORWARDER</b>   " + ("\U0001F7E1 PAUSED" if paused else "\U0001F7E2 ONLINE"),
-            f"\U0001F464 {acct}   \U0001F3AF {dest}",
-            "━" * 16,
-            f"\U0001F4E6 <b>Left to send: {counts['TOTAL_QUEUED']:,}</b>   (\U0001F534 live {counts['LIVE']:,} · backlog {counts['BACKLOG']:,})",
-            f"\U0001F4E4 <b>Sent: {stats.get('total_forwarded', 0):,}</b>   (today {stats.get('today_forwarded', 0):,})   ❌ failed {counts['FAILED']:,}",
-            f"⚡ now: {now_line}",
-            f"\U0001F6E1 rate: {rate}   ⏱ up {_fmt_uptime(stats.get('started_at'))}",
-            "",
-            f"\U0001F4E1 <b>SOURCES</b> ({len(sources)})",
+        head = [
+            f"\u26A1 <b>TG FORWARDER</b>   {status}",
+            f"\U0001F464 {acct}  \u2192  \U0001F3AF <b>{dest}</b>",
+            LINE,
+            f"\U0001F4CA <b>OVERALL  {pct}%</b>",
+            f"<code>{progress_bar(sent, total, 16)}</code>",
+            f"\u2705 <b>{sent:,}</b> sent   \u23F3 <b>{left:,}</b> left   \u274C {failed:,}",
+            f"\U0001F4C5 today {stats.get('today_forwarded', 0):,}   \U0001F534 live {counts['LIVE']:,}   "
+            f"\U0001F4E6 backlog {counts['BACKLOG']:,}",
+            LINE,
         ]
-        if not sources:
-            lines.append("none yet — open Sources → Add")
+
+        # ---- now forwarding
+        active_cid = None
+        if current:
+            active_cid = current["source_channel_id"]
+            src = by_id.get(active_cid)
+            n = len(current.get("message_ids") or [1])
+            title = escape_html(truncate(current.get("title") or f"#{current['source_message_id']}", 60))
+            icon = TYPE_ICON.get(current.get("media_type"), "\U0001F4C4")
+            link = message_link(src, current["source_message_id"]) if src else None
+            label = f'<a href="{link}">{title}</a>' if link else title
+            head.append("\u26A1 <b>NOW FORWARDING</b>")
+            head.append(f"{icon} {label}" + (f"  <i>(album, {n} files)</i>" if n > 1 else ""))
+            meta = []
+            fn = current.get("file_name")
+            if fn and fn not in title:
+                meta.append(f"\U0001F4CE {escape_html(truncate(fn, 38))}")
+            if current.get("file_size"):
+                meta.append(human_size(current["file_size"]))
+            if meta:
+                head.append("    " + " \u00B7 ".join(meta))
+            if src:
+                p = prog.get(active_cid, {})
+                done = src.get("stats", {}).get("forwarded", 0)
+                tot = done + p.get("left", 0) + p.get("failed", 0)
+                head.append(f"    \U0001F4E1 {escape_html(truncate(src['title'], 24))} \u00B7 file {done + 1:,} of {tot:,}")
+        else:
+            head.append("\u26A1 <b>NOW</b>  idle \u2014 waiting for next file")
+
+        # ---- last sent
+        recent = list(reversed((stats.get("recent") or [])[-3:]))
+        if recent:
+            head += ["", "\U0001F9FE <b>LAST SENT</b>"]
+            for r in recent:
+                t = escape_html(truncate(r.get("title") or "file", 44))
+                lab = f'<a href="{r["link"]}">{t}</a>' if r.get("link") else t
+                extra = f" +{r['n'] - 1}" if r.get("n", 1) > 1 else ""
+                head.append(f"{TYPE_ICON.get(r.get('type'), '')} {lab}{extra}  <i>{time_ago(r.get('at'))}</i>")
+        head += [LINE, f"\U0001F4E1 <b>SOURCES</b> ({len(sources)})"]
+
+        # ---- sources (as many as fit in 4096 chars)
+        base = "\n".join(head)
+        blocks = []
         for s in sources[:CARD_SOURCES]:
-            lines.append(source_progress_text(s, prog))
-        if len(sources) > CARD_SOURCES:
-            lines.append(f"… +{len(sources) - CARD_SOURCES} more (see Sources)")
-        text = "\n".join(lines)
-        if len(text) > 4000:
-            text = text[:3990] + "…"
-        return text, paused
+            blocks.append(source_progress_text(s, prog, active=(s["channel_id"] == active_cid)))
+        if not sources:
+            blocks.append("none yet \u2014 open Sources \u2192 Add")
+        while blocks and len(base) + sum(len(b) + 1 for b in blocks) > 3900:
+            blocks.pop()
+        hidden = len(sources) - len(blocks) if sources else 0
+        text = base + "\n" + "\n".join(blocks)
+        if hidden > 0:
+            text += f"\n\u2026 +{hidden} more (open Sources)"
+        return text, paused, failed
 
     # ---------------- card lifecycle
     async def initialize(self, chat_id: int):
@@ -119,8 +167,9 @@ class DashboardManager:
         async with self._lock:
             bot = self._get_bot()
             state = await db.get_dashboard_state()
-            text, paused = await self.build()
-            msg = await bot.send_message(chat_id, text, buttons=self._buttons(paused), parse_mode="html")
+            text, paused, failed = await self.build()
+            msg = await bot.send_message(chat_id, text, buttons=self._buttons(paused, failed), parse_mode="html",
+                                         link_preview=False)
             old_chat, old_id = state.get("chat_id"), state.get("message_id")
             await db.set_dashboard_message(chat_id, msg.id)
             await db.set_dashboard_last_text(text)
@@ -136,9 +185,9 @@ class DashboardManager:
         """Home/Refresh/Back button: turn the clicked message back into the card."""
         self.set_view("home")
         async with self._lock:
-            text, paused = await self.build()
+            text, paused, failed = await self.build()
             try:
-                await event.edit(text, buttons=self._buttons(paused), parse_mode="html")
+                await event.edit(text, buttons=self._buttons(paused, failed), parse_mode="html", link_preview=False)
             except MessageNotModifiedError:
                 pass
             await db.set_dashboard_message(event.chat_id, event.message_id)
@@ -157,13 +206,14 @@ class DashboardManager:
         if not force and time.monotonic() - self._last_edit < MIN_EDIT_GAP:
             return
         async with self._lock:
-            text, paused = await self.build()
+            text, paused, failed = await self.build()
             if not force and text == state.get("last_text"):
                 return
             bot = self._get_bot()
             try:
                 await bot.edit_message(state["chat_id"], state["message_id"], text,
-                                       buttons=self._buttons(paused), parse_mode="html")
+                                       buttons=self._buttons(paused, failed), parse_mode="html",
+                                       link_preview=False)
             except MessageNotModifiedError:
                 pass
             except MessageIdInvalidError:

@@ -15,6 +15,7 @@ All "single document" collections use a fixed _id so they can be
 upserted/read with a simple find_one/update_one call.
 """
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -72,6 +73,7 @@ class Database:
     def __init__(self):
         self.client: Optional[AsyncIOMotorClient] = None
         self.db = None
+        self._snap = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -441,31 +443,46 @@ class Database:
             logger.warning("Recovered %d job(s) stuck in PROCESSING after restart", result.modified_count)
         return result.modified_count
 
-    async def queue_counts(self) -> dict:
-        """Message-level counts (an album of 5 counts as 5)."""
+    async def queue_snapshot(self):
+        """(counts, per-source progress) from ONE aggregation, cached 2s so the
+        live card never hammers MongoDB. Message-level (album of 5 = 5)."""
+        if self._snap and time.monotonic() - self._snap[0] < 2.0:
+            return self._snap[1]
         pipeline = [
             {"$match": {"status": {"$in": _OPEN}}},
-            {"$group": {"_id": {"p": "$priority_type", "s": "$status"}, "n": {"$sum": _SIZE}}},
+            {"$group": {"_id": {"c": "$source_channel_id", "p": "$priority_type", "s": "$status"},
+                        "n": {"$sum": _SIZE}}},
         ]
         counts = {"LIVE": 0, "BACKLOG": 0, "FAILED": 0}
+        prog = {}
         async for r in self.db.jobs.aggregate(pipeline):
-            if r["_id"]["s"] == JobStatus.FAILED:
-                counts["FAILED"] += r["n"]
+            c, p, st, n = r["_id"]["c"], r["_id"]["p"], r["_id"]["s"], r["n"]
+            d = prog.setdefault(c, {"left": 0, "failed": 0})
+            if st == JobStatus.FAILED:
+                counts["FAILED"] += n
+                d["failed"] += n
             else:
-                counts[r["_id"]["p"]] = counts.get(r["_id"]["p"], 0) + r["n"]
+                counts[p] = counts.get(p, 0) + n
+                d["left"] += n
         counts["TOTAL_QUEUED"] = counts["LIVE"] + counts["BACKLOG"]
-        return counts
+        self._snap = (time.monotonic(), (counts, prog))
+        return self._snap[1]
+
+    async def queue_counts(self) -> dict:
+        return (await self.queue_snapshot())[0]
 
     async def source_progress(self) -> dict:
-        """{channel_id: {"left": n, "failed": n}} - 'done' comes from source stats."""
-        pipeline = [
-            {"$match": {"status": {"$in": _OPEN}}},
-            {"$group": {"_id": {"c": "$source_channel_id", "s": "$status"}, "n": {"$sum": _SIZE}}},
-        ]
-        out = {}
-        async for r in self.db.jobs.aggregate(pipeline):
-            d = out.setdefault(r["_id"]["c"], {"left": 0, "failed": 0})
-            d["failed" if r["_id"]["s"] == JobStatus.FAILED else "left"] += r["n"]
+        return (await self.queue_snapshot())[1]
+
+    async def next_jobs(self, limit: int = 5) -> list:
+        """What will be forwarded next (LIVE first, then BACKLOG order)."""
+        out = []
+        cur = self.db.jobs.find({"status": JobStatus.PENDING, "priority_type": Priority.LIVE}).sort("sequence", ASCENDING).limit(limit)
+        out += [d async for d in cur]
+        if len(out) < limit:
+            cur = self.db.jobs.find({"status": JobStatus.PENDING, "priority_type": Priority.BACKLOG}).sort(
+                [("source_order", ASCENDING), ("source_message_id", ASCENDING)]).limit(limit - len(out))
+            out += [d async for d in cur]
         return out
 
     async def get_current_job(self) -> Optional[dict]:
@@ -480,20 +497,19 @@ class Database:
     async def incr_stat(self, field: str, amount: int = 1):
         await self.db.stats.update_one({"_id": STATS_ID}, {"$inc": {field: amount}})
 
-    async def record_forward_success(self, n: int = 1):
+    async def record_forward_success(self, n: int = 1, entry: Optional[dict] = None):
         today = _today()
         stats = await self.get_stats()
         now = datetime.now(timezone.utc)
         if stats.get("today_date") != today:
-            await self.db.stats.update_one(
-                {"_id": STATS_ID},
-                {"$set": {"today_date": today, "today_forwarded": n, "last_forward_at": now},
-                 "$inc": {"total_forwarded": n}})
+            op = {"$set": {"today_date": today, "today_forwarded": n, "last_forward_at": now},
+                  "$inc": {"total_forwarded": n}}
         else:
-            await self.db.stats.update_one(
-                {"_id": STATS_ID},
-                {"$inc": {"total_forwarded": n, "today_forwarded": n},
-                 "$set": {"last_forward_at": now}})
+            op = {"$inc": {"total_forwarded": n, "today_forwarded": n},
+                  "$set": {"last_forward_at": now}}
+        if entry:  # rolling log of the last 5 forwarded files (title + link)
+            op["$push"] = {"recent": {"$each": [entry], "$slice": -5}}
+        await self.db.stats.update_one({"_id": STATS_ID}, op)
 
     async def record_forward_failure(self, error: str):
         await self.db.stats.update_one(

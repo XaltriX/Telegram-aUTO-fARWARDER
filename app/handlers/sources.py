@@ -254,6 +254,15 @@ async def _run_initial_scan(source: dict):
             f"\u26A0\uFE0F Initial scan failed for <b>{escape_html(source['title'])}</b>. Remove and re-add the source.")
 
 
+async def resume_scans():
+    """Re-run initial scans interrupted by a restart (idempotent thanks to dedup)."""
+    if not await account_manager.get_client():
+        return
+    for s in await db.list_sources():
+        if s.get("scan_done") is False:
+            await _run_initial_scan(s)
+
+
 async def _show_list(event, page: int):
     sources = await db.list_sources()
     prog = await db.source_progress()

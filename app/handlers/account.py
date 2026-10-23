@@ -97,6 +97,9 @@ async def handle_text(client, event, flow: str) -> bool:
         await monitor.refresh_handlers()
         from app.handlers.start import show_dashboard
         await show_dashboard(client, event.chat_id)
+        import asyncio
+        from app.handlers.sources import resume_scans
+        asyncio.create_task(resume_scans())
     else:
         conversation_state.clear(event.chat_id)
         await event.respond(

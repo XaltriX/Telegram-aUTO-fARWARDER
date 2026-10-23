@@ -9,7 +9,8 @@ from typing import List
 
 from app.database import db
 from app.models import JobStatus, Priority
-from app.utils.helpers import get_media_type, is_forwardable, media_type_enabled
+from app.utils.helpers import (caption_title, file_name_of, get_media_type, is_forwardable,
+                               media_type_enabled)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,9 @@ class QueueManager:
             "source_message_id": unit[0].id,
             "message_ids": [m.id for m in unit],
             "media_type": get_media_type(unit[0]),
+            "title": next((caption_title(m) for m in unit if (m.message or "").strip()), caption_title(unit[0])),
+            "file_name": file_name_of(unit[0]),
+            "file_size": sum((getattr(m.file, "size", 0) or 0) for m in unit if m.file),
             "grouped_id": unit[0].grouped_id,
             "priority_type": priority_type,
             "status": JobStatus.PENDING,

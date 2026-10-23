@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, MediaCaptionTooLongError
 from telethon.extensions import html as tg_html
 from telethon.tl.types import (MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage)
 
@@ -26,7 +26,7 @@ from app.config import config
 from app.database import db
 from app.models import JobStatus, SourceMessageGoneError
 from app.telegram_client import account_manager
-from app.utils.helpers import is_retryable_exception
+from app.utils.helpers import is_retryable_exception, message_link
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,8 @@ class Scheduler:
         self.on_job_failed: Optional[Callable] = None
         self.on_flood_wait: Optional[Callable] = None
         self._cb_tasks = set()
+        self._consec_fail = 0
+        self.on_auto_pause: Optional[Callable] = None
 
     async def run(self):
         self.running = True
@@ -121,7 +123,15 @@ class Scheduler:
                 forwarded_id = getattr(result, "id", None)
 
             await db.mark_job_done(job_id, forwarded_id)
-            await db.record_forward_success(len(message_ids))
+            source = await db.get_source(job["source_channel_id"])
+            entry = {
+                "title": job.get("title") or f"{job['media_type']} #{job['source_message_id']}",
+                "link": message_link(source, job["source_message_id"]) if source else None,
+                "type": job["media_type"], "n": len(message_ids),
+                "size": job.get("file_size") or 0, "at": datetime.now(timezone.utc),
+            }
+            await db.record_forward_success(len(message_ids), entry)
+            self._consec_fail = 0
             await db.incr_source_stat(job["source_channel_id"], "forwarded", len(message_ids))
 
             if self.on_job_done:
@@ -146,6 +156,7 @@ class Scheduler:
 
             if not is_retryable_exception(e) or attempts >= config.MAX_ATTEMPTS:
                 await db.fail_job(job_id, error_text)
+                await self._count_failure(e)
                 await db.record_forward_failure(error_text)
                 await db.incr_source_stat(job["source_channel_id"], "failed")
                 if self.on_job_failed:
@@ -155,6 +166,19 @@ class Scheduler:
                 retry_after = datetime.now(timezone.utc) + timedelta(seconds=backoff)
                 await db.requeue_job(job_id, error_text, retry_after=retry_after)
                 logger.info("Job %s will retry in %ss (%d/%d)", job_id, backoff, attempts, config.MAX_ATTEMPTS)
+
+    async def _count_failure(self, exc):
+        """Many terminal failures in a row = a config problem (permissions,
+        wrong destination). Pause instead of burning through the whole queue."""
+        if isinstance(exc, SourceMessageGoneError):
+            return
+        self._consec_fail += 1
+        if self._consec_fail >= 10:
+            self._consec_fail = 0
+            await db.set_paused(True)
+            logger.error("10 consecutive failures - auto-paused")
+            if self.on_auto_pause:
+                await self._safe_call(self.on_auto_pause)
 
     async def _safe_call(self, fn, *args):
         """Fire-and-forget: UI callbacks must never slow down forwarding."""
@@ -194,9 +218,16 @@ class Scheduler:
     async def _copy_single(client, dest_entity, msg):
         media = msg.media
         if isinstance(media, (MessageMediaPhoto, MessageMediaDocument)):
-            return await client.send_file(
-                dest_entity, media, caption=msg.message or "",
-                formatting_entities=msg.entities, parse_mode=None)
+            try:
+                return await client.send_file(
+                    dest_entity, media, caption=msg.message or "",
+                    formatting_entities=msg.entities, parse_mode=None)
+            except MediaCaptionTooLongError:
+                # account can't attach this long a caption: send file, then the full text under it
+                sent = await client.send_file(dest_entity, media)
+                await client.send_message(dest_entity, msg.message, formatting_entities=msg.entities,
+                                          parse_mode=None, reply_to=sent)
+                return sent
         if media is None or isinstance(media, MessageMediaWebPage):
             return await client.send_message(
                 dest_entity, msg.message or "", formatting_entities=msg.entities,
@@ -207,10 +238,16 @@ class Scheduler:
     @staticmethod
     async def _copy_album(client, dest_entity, msgs):
         msgs = [m for m in sorted(msgs, key=lambda m: m.id) if m.media]
-        # per-item captions keep their formatting via html round-trip
         captions = [tg_html.unparse(m.message or "", m.entities or []) for m in msgs]
-        return await client.send_file(dest_entity, [m.media for m in msgs],
-                                      caption=captions, parse_mode="html")
+        media = [m.media for m in msgs]
+        try:
+            return await client.send_file(dest_entity, media, caption=captions, parse_mode="html")
+        except MediaCaptionTooLongError:
+            sent = await client.send_file(dest_entity, media)
+            text = "\n\n".join(c for c in captions if c)
+            if text:
+                await client.send_message(dest_entity, text[:4096], parse_mode="html", reply_to=sent[0])
+            return sent
 
 
 scheduler = Scheduler()

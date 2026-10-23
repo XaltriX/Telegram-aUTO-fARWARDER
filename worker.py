@@ -57,6 +57,9 @@ class Application:
             asyncio.create_task(monitor.recovery_loop(), name="recovery"),
         ]
 
+        from app.handlers.sources import resume_scans
+        self._tasks.append(asyncio.create_task(resume_scans(), name="resume_scans"))
+
         logger.info("All subsystems started. Send /start to the bot as OWNER_ID=%s.", config.OWNER_ID)
         await asyncio.gather(*self._tasks)
 
@@ -77,9 +80,18 @@ class Application:
         async def on_done(job, forwarded_id):
             await _refresh()
 
+        last_fail_notice = [0.0]
+
         async def on_failed(job, error):
-            await _notice(f"\u26A0\uFE0F <b>FAILED</b> msg #{job['source_message_id']}\n{error[:150]}")
+            import time
+            if time.monotonic() - last_fail_notice[0] > 30:  # at most one notice / 30s
+                last_fail_notice[0] = time.monotonic()
+                await _notice(f"\u26A0\uFE0F <b>FAILED</b> {job.get('title') or job['source_message_id']}\n{error[:150]}")
             await _refresh()
+
+        async def on_auto_pause():
+            await _notice("\u26D4 <b>Auto-paused</b>: 10 files failed in a row. Check destination permissions, then press Resume.")
+            await _refresh(force=True)
 
         async def on_flood_wait(job, seconds):
             await _notice(f"\U0001F6A6 <b>RATE LIMITED</b> \u2014 waiting {seconds}s")
@@ -89,6 +101,7 @@ class Application:
         scheduler.on_job_done = on_done
         scheduler.on_job_failed = on_failed
         scheduler.on_flood_wait = on_flood_wait
+        scheduler.on_auto_pause = on_auto_pause
         monitor.on_queue_change = _refresh
 
     async def shutdown(self):

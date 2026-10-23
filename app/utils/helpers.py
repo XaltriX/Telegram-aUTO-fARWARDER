@@ -75,7 +75,65 @@ def progress_bar(done: int, total: int, width: int = 10) -> str:
     return "\u2593" * filled + "\u2591" * (width - filled)
 
 
-def source_progress_text(s: dict, prog: dict) -> str:
+TYPE_ICON = {"video": "\U0001F3AC", "photo": "\U0001F5BC", "audio": "\U0001F3B5",
+             "voice": "\U0001F399", "document": "\U0001F4C4", "text": "\U0001F4DD"}
+
+
+def human_size(n) -> str:
+    if not n:
+        return ""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def time_ago(dt) -> str:
+    if not dt:
+        return "never"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    s = int((datetime.now(timezone.utc) - dt).total_seconds())
+    if s < 60:
+        return f"{max(s, 0)}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+def message_link(source: dict, msg_id: int) -> str:
+    """Public link t.me/<user>/<id>, or private-channel link t.me/c/<id>/<id>."""
+    if source.get("username"):
+        return f"https://t.me/{source['username']}/{msg_id}"
+    s = str(abs(int(source["channel_id"])))
+    if s.startswith("100") and len(s) > 10:
+        s = s[3:]
+    return f"https://t.me/c/{s}/{msg_id}"
+
+
+def file_name_of(message) -> str:
+    try:
+        if message.file and message.file.name:
+            return message.file.name
+        if message.file:
+            return f"{get_media_type(message)}_{message.id}{message.file.ext or ''}"
+    except Exception:
+        pass
+    return ""
+
+
+def caption_title(message, limit: int = 80) -> str:
+    """Best human label: first caption line, else file name, else type+id."""
+    for line in (message.message or "").splitlines():
+        if line.strip():
+            return truncate(line.strip(), limit)
+    return file_name_of(message) or f"{get_media_type(message)} #{message.id}"
+
+
+def source_progress_text(s: dict, prog: dict, active: bool = False) -> str:
     """Multi-line HTML block: bar, sent / left / total for one source."""
     st = s.get("stats", {})
     done = st.get("forwarded", 0)
@@ -83,7 +141,7 @@ def source_progress_text(s: dict, prog: dict) -> str:
     left, failed = p.get("left", 0), p.get("failed", 0)
     total = done + left + failed
     pct = int(100 * done / total) if total else 0
-    icon = "\U0001F7E2" if s.get("enabled", True) else "\u26AA"
+    icon = "\u25B6\uFE0F" if active else ("\U0001F7E2" if s.get("enabled", True) else "\u26AA")
     out = (f"{icon} <b>{escape_html(truncate(s['title'], 28))}</b>\n"
            f"   {progress_bar(done, total)} {pct}%\n"
            f"   \u2705 {done:,} sent  \u23F3 {left:,} left  \U0001F4E5 {total:,} total")
