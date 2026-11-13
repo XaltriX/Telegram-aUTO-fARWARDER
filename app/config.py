@@ -28,11 +28,11 @@ load_dotenv()
 # =====================================================================
 #                         YOUR VALUES (fill these)
 # =====================================================================
-BOT_TOKEN_VALUE = ""      # from @BotFather, e.g. "123456789:AAxxxxxxxx"
-API_ID_VALUE = ""         # from https://my.telegram.org, e.g. "1234567"
-API_HASH_VALUE = ""       # from https://my.telegram.org
-MONGO_URI_VALUE = ""      # e.g. "mongodb+srv://user:pass@cluster0.xxxx.mongodb.net/?retryWrites=true&w=majority"
-OWNER_ID_VALUE = ""       # your numeric Telegram user id (from @userinfobot)
+BOT_TOKEN_VALUE = "8393052840:AAGZdhlWu_3HVCHOZX-dABwWu2H3y-aSCC8"      # from @BotFather, e.g. "123456789:AAxxxxxxxx"
+API_ID_VALUE = "34600985"         # from https://my.telegram.org, e.g. "1234567"
+API_HASH_VALUE = "cbce1040feefe5c10fe5a8c17d573274"       # from https://my.telegram.org
+MONGO_URI_VALUE = "mongodb+srv://VishnuJs:sfphtBLg@cluster0.lku9w7d.mongodb.net/?appName=Cluster0"      # e.g. "mongodb+srv://user:pass@cluster0.xxxx.mongodb.net/?retryWrites=true&w=majority"
+OWNER_ID_VALUE = "5706788169"       # your numeric Telegram user id (from @userinfobot)
 
 # =====================================================================
 #                 OPTIONAL SETTINGS (defaults are fine)
