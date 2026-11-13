@@ -20,11 +20,14 @@ async def show_dashboard(bot_client, chat_id: int):
     from app.dashboard import dashboard_manager
     if dashboard_manager is None:
         return
+    # Always send a FRESH dashboard at the bottom of the chat. The saved
+    # message id may belong to an old message far up the chat (it persists in
+    # MongoDB across restarts/new Heroku apps), and editing that one in place
+    # looks like the bot ignored /start.
     state = await db.get_dashboard_state()
-    if state and state.get("message_id"):
+    if state.get("chat_id") and state.get("message_id"):
         try:
-            await dashboard_manager.refresh(force=True)
-            return
+            await bot_client.delete_messages(state["chat_id"], [state["message_id"]])
         except Exception:
-            logger.exception("Failed to refresh existing dashboard, re-initializing")
+            pass  # already deleted / not deletable - fine
     await dashboard_manager.initialize(chat_id)

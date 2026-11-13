@@ -52,6 +52,9 @@ conversation_state = ConversationState()
 def owner_only_message(handler):
     async def wrapper(event):
         if event.sender_id != config.OWNER_ID:
+            # Log only ids (not secrets) so a wrong OWNER_ID is easy to spot.
+            logger.warning("Ignored message from non-owner user id=%s (configured OWNER_ID=%s)",
+                           event.sender_id, config.OWNER_ID)
             return
         return await handler(event)
     return wrapper
@@ -97,7 +100,11 @@ def register_handlers(client: TelegramClient):
     @client.on(events.NewMessage(pattern=r"^/(start|dashboard)$"))
     @owner_only_message
     async def _start(event):
-        await h_start.show_dashboard(client, event.chat_id)
+        try:
+            await h_start.show_dashboard(client, event.chat_id)
+        except Exception as e:
+            logger.exception("/start failed")
+            await event.respond(f"\u274C Dashboard error: {type(e).__name__}: {str(e)[:200]}")
 
     @client.on(events.NewMessage(pattern=r"^/cancel$"))
     @owner_only_message
