@@ -36,56 +36,40 @@ def register(client):
         if dashboard_manager:
             await dashboard_manager.refresh(force=True)
 
-
-    @client.on(events.CallbackQuery(pattern=b"^ctl:(refresh|home)$"))
+    @client.on(events.CallbackQuery(pattern=b"^ctl:refresh$"))
     @owner_only_callback
     async def _refresh(event):
-        from app.dashboard import dashboard_manager
-        await dashboard_manager.show_home(event)
-        await event.answer()
+        from app.handlers.start import show_dashboard
+        await event.delete()
+        await show_dashboard(client, event.chat_id)
 
 
 async def _show_menu(event):
-    from app.utils.helpers import TYPE_ICON, escape_html, message_link, truncate
     counts = await db.queue_counts()
-    sources = {s["channel_id"]: s for s in await db.list_sources()}
     lines = [
-        "\U0001F4E5 <b>QUEUE</b>", "\u2501" * 18,
-        f"\U0001F534 live {counts['LIVE']:,}    \U0001F4E6 backlog {counts['BACKLOG']:,}    \u274C failed {counts['FAILED']:,}",
-        f"\u23F3 <b>{counts['TOTAL_QUEUED']:,}</b> files left to send", "",
-        "\u23ED <b>UP NEXT</b>",
+        "\U0001F4E5 <b>Queue</b>", "",
+        f"\U0001F534 LIVE       {counts['LIVE']:,}",
+        f"\U0001F4E6 BACKLOG    {counts['BACKLOG']:,}",
+        f"\u274C FAILED     {counts['FAILED']:,}",
+        f"\u2795 TOTAL      {counts['TOTAL_QUEUED']:,}",
     ]
-    nxt = await db.next_jobs(5)
-    if not nxt:
-        lines.append("nothing queued")
-    for j in nxt:
-        src = sources.get(j["source_channel_id"])
-        t = escape_html(truncate(j.get("title") or f"#{j['source_message_id']}", 46))
-        link = message_link(src, j["source_message_id"]) if src else None
-        lab = f'<a href="{link}">{t}</a>' if link else t
-        n = len(j.get("message_ids") or [1])
-        lines.append(f"{TYPE_ICON.get(j['media_type'], '')} {lab}" + (f" (+{n-1})" if n > 1 else ""))
-    buttons = []
-    if counts["FAILED"]:
-        buttons.append([Button.inline(f"\u274C View failed ({counts['FAILED']:,})", b"queue:failed"),
-                        Button.inline("\U0001F501 Retry all", b"queue:retry_all")])
-    buttons.append([Button.inline("\U0001F504 Refresh", b"queue:menu"),
-                    Button.inline("\u2B05\uFE0F Back", b"ctl:home")])
-    await event.edit("\n".join(lines), parse_mode="html", buttons=buttons, link_preview=False)
+    buttons = [
+        [Button.inline("\u274C Failed", b"queue:failed")],
+        [Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:refresh")],
+    ]
+    await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)
 
 
 async def _show_failed(event):
-    from app.utils.helpers import escape_html, truncate
-    jobs = await db.list_failed_jobs(limit=8)
-    lines = ["\u274C <b>FAILED</b> (latest 8)", "\u2501" * 18]
+    jobs = await db.list_failed_jobs(limit=10)
+    lines = ["\u274C <b>Failed Jobs</b> (latest 10)", ""]
     if not jobs:
         lines.append("None \U0001F389")
     for j in jobs:
-        t = escape_html(truncate(j.get("title") or f"msg {j['source_message_id']}", 40))
-        err = escape_html(truncate(j.get("last_error") or "unknown error", 70))
-        lines.append(f"\u2022 {t}\n   <i>{err}</i>")
+        lines.append(f"\u2022 src {j['source_channel_id']} / msg {j['source_message_id']} "
+                      f"\u2014 {j.get('last_error', 'unknown error')[:60]}")
     buttons = [
-        [Button.inline("\U0001F501 Retry all", b"queue:retry_all")],
+        [Button.inline("\U0001F501 Retry Failed", b"queue:retry_all")],
         [Button.inline("\u2B05\uFE0F Back", b"queue:menu")],
     ]
-    await event.edit("\n".join(lines), parse_mode="html", buttons=buttons, link_preview=False)
+    await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)

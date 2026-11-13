@@ -97,11 +97,6 @@ async def handle_text(client, event, flow: str) -> bool:
         await monitor.refresh_handlers()
         from app.handlers.start import show_dashboard
         await show_dashboard(client, event.chat_id)
-        import asyncio
-        from app.handlers.sources import resume_scans
-        asyncio.create_task(resume_scans())
-        from app.dest_index import dest_indexer
-        asyncio.create_task(dest_indexer.ensure())
     else:
         conversation_state.clear(event.chat_id)
         await event.respond(
@@ -129,5 +124,5 @@ async def _show_menu(event):
     else:
         lines.append("Status: \u274C Disconnected")
         buttons = [[Button.inline("\U0001F511 Login (Paste Session String)", b"account:login_start")]]
-    buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:home")])
+    buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:refresh")])
     await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)

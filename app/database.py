@@ -14,53 +14,19 @@ Collections:
 All "single document" collections use a fixed _id so they can be
 upserted/read with a simple find_one/update_one call.
 """
+import asyncio
 import logging
-import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, DESCENDING, IndexModel
-from pymongo.errors import BulkWriteError, DuplicateKeyError
+from pymongo.errors import DuplicateKeyError
 
 from app.config import config
 from app.models import DEFAULT_MEDIA_FILTERS, JobStatus, LoginState, Priority
 
 logger = logging.getLogger(__name__)
-
-# message-level size of a job (albums hold several messages)
-_SIZE = {"$size": {"$ifNull": ["$message_ids", [1]]}}
-_OPEN = [JobStatus.PENDING, JobStatus.PROCESSING, JobStatus.FAILED]
-
-
-def _today() -> str:
-    try:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo(config.TIMEZONE)
-    except Exception:
-        tz = timezone.utc
-    return datetime.now(tz).strftime("%Y-%m-%d")
-
-
-def _fernet():
-    if not config.SESSION_ENCRYPTION_KEY:
-        return None
-    from cryptography.fernet import Fernet
-    return Fernet(config.SESSION_ENCRYPTION_KEY.encode())
-
-
-def _enc(v: str) -> str:
-    f = _fernet()
-    return "enc:" + f.encrypt(v.encode()).decode() if f else v
-
-
-def _dec(v):
-    if v and v.startswith("enc:"):
-        f = _fernet()
-        if not f:
-            raise RuntimeError("Stored session is encrypted but SESSION_ENCRYPTION_KEY is not set")
-        return f.decrypt(v[4:].encode()).decode()
-    return v
 
 SETTINGS_ID = "settings"
 SESSION_ID = "account_session"
@@ -73,7 +39,6 @@ class Database:
     def __init__(self):
         self.client: Optional[AsyncIOMotorClient] = None
         self.db = None
-        self._snap = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -138,7 +103,7 @@ class Database:
                     "total_forwarded": 0,
                     "total_failed": 0,
                     "today_forwarded": 0,
-                    "today_date": _today(),
+                    "today_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                     "last_forward_at": None,
                     "last_error": None,
                     "started_at": datetime.now(timezone.utc),
@@ -171,15 +136,17 @@ class Database:
             IndexModel([("source_channel_id", ASCENDING), ("source_message_id", ASCENDING)],
                        unique=True, name="uniq_source_message"),
             IndexModel([("status", ASCENDING)], name="status_idx"),
-            IndexModel([("grouped_id", ASCENDING)], name="grouped_id_idx"),
+            # used by the periodic cleanup (status + completed_at range delete)
+            IndexModel([("status", ASCENDING), ("completed_at", ASCENDING)], name="cleanup_idx"),
         ])
-        await self.db.jobs.create_indexes([
-            IndexModel([("source_channel_id", ASCENDING), ("message_ids", ASCENDING)], name="src_msgids_idx"),
-            IndexModel([("status", ASCENDING), ("priority_type", ASCENDING), ("retry_after", ASCENDING)],
-                       name="retry_idx"),
-            IndexModel([("fps", ASCENDING)], name="fps_idx"),
+        # Mongo deletes old dedup-ledger entries by itself (native TTL),
+        # even while the worker is down. _id already has a built-in index.
+        await self.db.processed_message_ids.create_indexes([
+            IndexModel([("reserved_at", ASCENDING)],
+                       expireAfterSeconds=int(config.LEDGER_RETENTION_DAYS * 86400),
+                       name="ledger_ttl"),
+            IndexModel([("source_channel_id", ASCENDING)], name="ledger_source_idx"),
         ])
-        await self.db.counters.create_indexes([IndexModel([("_id", ASCENDING)])])
 
     # ------------------------------------------------------------------
     # Counters (atomic sequence generator for global LIVE arrival order)
@@ -238,13 +205,10 @@ class Database:
     # Account session
     # ------------------------------------------------------------------
     async def get_session(self) -> dict:
-        doc = await self.db.account_session.find_one({"_id": SESSION_ID}) or {}
-        if doc.get("string_session"):
-            doc["string_session"] = _dec(doc["string_session"])
-        return doc
+        return await self.db.account_session.find_one({"_id": SESSION_ID}) or {}
 
     async def save_session_string(self, string_session: str, phone: str = None):
-        update = {"string_session": _enc(string_session), "connected": True,
+        update = {"string_session": string_session, "connected": True,
                   "login_state": LoginState.COMPLETE, "updated_at": datetime.now(timezone.utc)}
         if phone:
             update["phone"] = phone
@@ -282,7 +246,6 @@ class Database:
             "source_order": order,
             "created_at": datetime.now(timezone.utc),
             "last_seen_message_id": 0,
-            "scan_done": False,
             "last_sync_at": None,
             "scan_config": scan_config,
             "stats": {"discovered": 0, "queued": 0, "forwarded": 0, "failed": 0},
@@ -329,73 +292,36 @@ class Database:
             await self.db.jobs.delete_many(
                 {"source_channel_id": channel_id, "status": {"$in": [JobStatus.PENDING, JobStatus.FAILED]}}
             )
+            await self.db.processed_message_ids.delete_many({"source_channel_id": channel_id})
 
     # ------------------------------------------------------------------
-    # Dedup: the unique (source_channel_id, source_message_id) index plus
-    # this lookup of already-queued message ids (no separate ledger, so a
-    # crash can never leave a message "reserved" without a job).
+    # Dedup ledger
     # ------------------------------------------------------------------
-    async def existing_message_ids(self, channel_id: int, ids: list) -> set:
-        seen = set()
-        cur = self.db.jobs.find({"source_channel_id": channel_id, "message_ids": {"$in": ids}},
-                                {"message_ids": 1})
-        async for d in cur:
-            seen.update(d.get("message_ids") or [])
-        return seen
+    async def reserve_message_ids(self, channel_id: int, message_ids: list, job_key: str) -> list:
+        """
+        Attempt to reserve each (channel_id, message_id) pair as 'claimed'.
+        Returns the subset of message_ids that were newly reserved (not
+        already processed). If a message id is already reserved, it is
+        skipped (duplicate protection).
+        """
+        new_ids = []
+        for mid in message_ids:
+            doc_id = f"{channel_id}:{mid}"
+            try:
+                await self.db.processed_message_ids.insert_one({
+                    "_id": doc_id,
+                    "source_channel_id": channel_id,
+                    "reserved_at": datetime.now(timezone.utc),  # TTL field
+                })
+                new_ids.append(mid)
+            except DuplicateKeyError:
+                continue
+        return new_ids
 
-    async def insert_ignore_dups(self, coll, docs: list):
-        if not docs:
-            return
-        try:
-            await coll.insert_many(docs, ordered=False)
-        except BulkWriteError as e:
-            if any(w.get("code") != 11000 for w in e.details.get("writeErrors", [])):
-                raise
-
-    async def indexed(self, dest, fps: list) -> set:
-        """Which of these fingerprints already exist in the destination."""
-        out = set()
-        for i in range(0, len(fps), 500):
-            chunk = [f"{dest}|{f}" for f in fps[i:i + 500]]
-            async for d in self.db.dest_index.find({"_id": {"$in": chunk}}, {"_id": 1}):
-                out.add(d["_id"].split("|", 1)[1])
-        return out
-
-    async def open_job_fps(self, fps: list) -> set:
-        """Fingerprints already waiting in the queue (any source)."""
-        out = set()
-        for i in range(0, len(fps), 500):
-            cur = self.db.jobs.find({"fps": {"$in": fps[i:i + 500]},
-                                     "status": {"$in": [JobStatus.PENDING, JobStatus.PROCESSING]}},
-                                    {"fps": 1})
-            async for d in cur:
-                out.update(d.get("fps") or [])
-        return out
-
-    async def add_dest_fps(self, dest, fps: list, msg_id):
-        await self.insert_ignore_dups(
-            self.db.dest_index, [{"_id": f"{dest}|{f}", "msg_id": msg_id} for f in set(fps)])
-
-    async def dest_index_ready(self) -> bool:
-        s = await self.get_settings()
-        di = s.get("dest_index") or {}
-        return bool(s.get("destination_channel_id")) and di.get("state") == "done" \
-            and di.get("dest_id") == s.get("destination_channel_id")
-
-    async def insert_jobs(self, jobs: list) -> list:
-        """Bulk insert; duplicates (unique index) are silently skipped.
-        Returns the jobs that were actually inserted."""
-        if not jobs:
-            return []
-        try:
-            await self.db.jobs.insert_many(jobs, ordered=False)
-            return jobs
-        except BulkWriteError as e:
-            errs = e.details.get("writeErrors", [])
-            if any(w.get("code") != 11000 for w in errs):
-                raise
-            bad = {w["index"] for w in errs}
-            return [j for i, j in enumerate(jobs) if i not in bad]
+    async def release_message_ids(self, channel_id: int, message_ids: list):
+        """Rollback reservation (used if job creation fails after reserving)."""
+        ids = [f"{channel_id}:{mid}" for mid in message_ids]
+        await self.db.processed_message_ids.delete_many({"_id": {"$in": ids}})
 
     # ------------------------------------------------------------------
     # Jobs
@@ -409,21 +335,69 @@ class Database:
             return None
 
     async def claim_next_job(self) -> Optional[dict]:
-        """Atomically lock the next job. LIVE (by sequence) beats BACKLOG
-        (by source_order, message id). Jobs in retry back-off are skipped."""
+        """
+        Atomically pick and lock the next job to process.
+        LIVE (by sequence) always takes priority over BACKLOG
+        (by source_order, then source_message_id).
+        """
         now = datetime.now(timezone.utc)
-        ready = {"status": JobStatus.PENDING,
-                 "$or": [{"retry_after": None}, {"retry_after": {"$lte": now}}]}
-        upd = {"$set": {"status": JobStatus.PROCESSING, "started_at": now}}
         job = await self.db.jobs.find_one_and_update(
-            {**ready, "priority_type": Priority.LIVE}, upd,
-            sort=[("sequence", ASCENDING)], return_document=True)
+            {"status": JobStatus.PENDING, "priority_type": Priority.LIVE},
+            {"$set": {"status": JobStatus.PROCESSING, "started_at": now}},
+            sort=[("sequence", ASCENDING)],
+            return_document=True,
+        )
         if job:
             return job
-        return await self.db.jobs.find_one_and_update(
-            {**ready, "priority_type": Priority.BACKLOG}, upd,
+        job = await self.db.jobs.find_one_and_update(
+            {"status": JobStatus.PENDING, "priority_type": Priority.BACKLOG},
+            {"$set": {"status": JobStatus.PROCESSING, "started_at": now}},
             sort=[("source_order", ASCENDING), ("source_message_id", ASCENDING)],
-            return_document=True)
+            return_document=True,
+        )
+        return job
+
+    # ------------------------------------------------------------------
+    # Auto-cleanup (keeps MongoDB small)
+    # ------------------------------------------------------------------
+    async def cleanup_old_data(self) -> dict:
+        """Delete finished/old data nobody needs. Never touches PENDING /
+        PROCESSING jobs, sources, settings, session or stats counters."""
+        now = datetime.now(timezone.utc)
+        done = await self.db.jobs.delete_many({
+            "status": JobStatus.DONE,
+            "completed_at": {"$lt": now - timedelta(hours=config.JOB_DONE_RETENTION_HOURS)},
+        })
+        failed = await self.db.jobs.delete_many({
+            "status": JobStatus.FAILED,
+            "completed_at": {"$lt": now - timedelta(days=config.JOB_FAILED_RETENTION_DAYS)},
+        })
+        # Ledger entries are normally expired by the TTL index; this also
+        # covers an index that was created before the setting changed.
+        ledger = await self.db.processed_message_ids.delete_many({
+            "reserved_at": {"$lt": now - timedelta(days=config.LEDGER_RETENTION_DAYS)},
+        })
+        result = {"done_jobs": done.deleted_count, "failed_jobs": failed.deleted_count,
+                  "ledger": ledger.deleted_count}
+        if any(result.values()):
+            logger.info("Cleanup removed %s", result)
+        return result
+
+    async def cleanup_loop(self):
+        await asyncio.sleep(30)  # let startup settle
+        while True:
+            try:
+                await self.cleanup_old_data()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Cleanup cycle failed")
+            await asyncio.sleep(config.CLEANUP_INTERVAL_MINUTES * 60)
+
+    async def storage_info(self) -> dict:
+        stats = await self.db.command("dbStats")
+        return {"data_mb": stats.get("dataSize", 0) / 1048576,
+                "storage_mb": stats.get("storageSize", 0) / 1048576}
 
     async def mark_job_done(self, job_id, forwarded_message_id: Optional[int]):
         await self.db.jobs.update_one(
@@ -435,13 +409,16 @@ class Database:
             }},
         )
 
-    async def requeue_job(self, job_id, error: str, retry_after: Optional[datetime] = None,
-                          count_attempt: bool = True):
-        op = {"$set": {"status": JobStatus.PENDING, "last_error": error,
-                       "started_at": None, "retry_after": retry_after}}
-        if count_attempt:
-            op["$inc"] = {"attempts": 1}
-        await self.db.jobs.update_one({"_id": job_id}, op)
+    async def requeue_job(self, job_id, error: str, retry_after: Optional[datetime] = None):
+        """Put a job back to PENDING (kept in its original priority queue)."""
+        update = {
+            "status": JobStatus.PENDING,
+            "last_error": error,
+            "started_at": None,
+        }
+        if retry_after:
+            update["retry_after"] = retry_after
+        await self.db.jobs.update_one({"_id": job_id}, {"$inc": {"attempts": 1}, "$set": update})
 
     async def fail_job(self, job_id, error: str):
         await self.db.jobs.update_one(
@@ -461,8 +438,7 @@ class Database:
     async def requeue_all_failed(self) -> int:
         result = await self.db.jobs.update_many(
             {"status": JobStatus.FAILED},
-            {"$set": {"status": JobStatus.PENDING, "attempts": 0, "last_error": None, "started_at": None,
-                      "retry_after": None}},
+            {"$set": {"status": JobStatus.PENDING, "attempts": 0, "last_error": None, "started_at": None}},
         )
         return result.modified_count
 
@@ -483,47 +459,18 @@ class Database:
             logger.warning("Recovered %d job(s) stuck in PROCESSING after restart", result.modified_count)
         return result.modified_count
 
-    async def queue_snapshot(self):
-        """(counts, per-source progress) from ONE aggregation, cached 2s so the
-        live card never hammers MongoDB. Message-level (album of 5 = 5)."""
-        if self._snap and time.monotonic() - self._snap[0] < 2.0:
-            return self._snap[1]
-        pipeline = [
-            {"$match": {"status": {"$in": _OPEN}}},
-            {"$group": {"_id": {"c": "$source_channel_id", "p": "$priority_type", "s": "$status"},
-                        "n": {"$sum": _SIZE}}},
-        ]
-        counts = {"LIVE": 0, "BACKLOG": 0, "FAILED": 0}
-        prog = {}
-        async for r in self.db.jobs.aggregate(pipeline):
-            c, p, st, n = r["_id"]["c"], r["_id"]["p"], r["_id"]["s"], r["n"]
-            d = prog.setdefault(c, {"left": 0, "failed": 0})
-            if st == JobStatus.FAILED:
-                counts["FAILED"] += n
-                d["failed"] += n
-            else:
-                counts[p] = counts.get(p, 0) + n
-                d["left"] += n
-        counts["TOTAL_QUEUED"] = counts["LIVE"] + counts["BACKLOG"]
-        self._snap = (time.monotonic(), (counts, prog))
-        return self._snap[1]
-
     async def queue_counts(self) -> dict:
-        return (await self.queue_snapshot())[0]
-
-    async def source_progress(self) -> dict:
-        return (await self.queue_snapshot())[1]
-
-    async def next_jobs(self, limit: int = 5) -> list:
-        """What will be forwarded next (LIVE first, then BACKLOG order)."""
-        out = []
-        cur = self.db.jobs.find({"status": JobStatus.PENDING, "priority_type": Priority.LIVE}).sort("sequence", ASCENDING).limit(limit)
-        out += [d async for d in cur]
-        if len(out) < limit:
-            cur = self.db.jobs.find({"status": JobStatus.PENDING, "priority_type": Priority.BACKLOG}).sort(
-                [("source_order", ASCENDING), ("source_message_id", ASCENDING)]).limit(limit - len(out))
-            out += [d async for d in cur]
-        return out
+        pipeline = [
+            {"$match": {"status": {"$in": [JobStatus.PENDING, JobStatus.PROCESSING]}}},
+            {"$group": {"_id": "$priority_type", "count": {"$sum": 1}}},
+        ]
+        counts = {"LIVE": 0, "BACKLOG": 0}
+        async for row in self.db.jobs.aggregate(pipeline):
+            counts[row["_id"]] = row["count"]
+        failed = await self.db.jobs.count_documents({"status": JobStatus.FAILED})
+        counts["FAILED"] = failed
+        counts["TOTAL_QUEUED"] = counts["LIVE"] + counts["BACKLOG"]
+        return counts
 
     async def get_current_job(self) -> Optional[dict]:
         return await self.db.jobs.find_one({"status": JobStatus.PROCESSING})
@@ -537,19 +484,25 @@ class Database:
     async def incr_stat(self, field: str, amount: int = 1):
         await self.db.stats.update_one({"_id": STATS_ID}, {"$inc": {field: amount}})
 
-    async def record_forward_success(self, n: int = 1, entry: Optional[dict] = None):
-        today = _today()
+    async def record_forward_success(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         stats = await self.get_stats()
         now = datetime.now(timezone.utc)
         if stats.get("today_date") != today:
-            op = {"$set": {"today_date": today, "today_forwarded": n, "last_forward_at": now},
-                  "$inc": {"total_forwarded": n}}
+            # A Python dict literal cannot have two "$set" keys - the second
+            # one silently overwrites the first, so today_date/today_forwarded
+            # were never actually applied. Merge into a single $set instead.
+            await self.db.stats.update_one(
+                {"_id": STATS_ID},
+                {"$set": {"today_date": today, "today_forwarded": 1, "last_forward_at": now},
+                 "$inc": {"total_forwarded": 1}},
+            )
         else:
-            op = {"$inc": {"total_forwarded": n, "today_forwarded": n},
-                  "$set": {"last_forward_at": now}}
-        if entry:  # rolling log of the last 5 forwarded files (title + link)
-            op["$push"] = {"recent": {"$each": [entry], "$slice": -5}}
-        await self.db.stats.update_one({"_id": STATS_ID}, op)
+            await self.db.stats.update_one(
+                {"_id": STATS_ID},
+                {"$inc": {"total_forwarded": 1, "today_forwarded": 1},
+                 "$set": {"last_forward_at": now}},
+            )
 
     async def record_forward_failure(self, error: str):
         await self.db.stats.update_one(

@@ -5,7 +5,6 @@ from telethon import Button, events
 
 from app.bot import owner_only_callback
 from app.database import db
-from app.utils.helpers import source_progress_text
 
 
 def register(client):
@@ -15,7 +14,6 @@ def register(client):
         stats = await db.get_stats()
         counts = await db.queue_counts()
         sources = await db.list_sources()
-        prog = await db.source_progress()
 
         lines = [
             "\U0001F4CA <b>Statistics</b>", "",
@@ -34,8 +32,10 @@ def register(client):
             "",
             "<b>Per-source:</b>",
         ]
-        for s in sources[:8]:
-            lines.append(source_progress_text(s, prog))
+        for s in sources[:10]:
+            st = s.get("stats", {})
+            lines.append(f"\u2022 {s['title'][:24]}: fwd {st.get('forwarded', 0)}, "
+                          f"failed {st.get('failed', 0)}")
 
-        buttons = [[Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:home")]]
+        buttons = [[Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:refresh")]]
         await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)

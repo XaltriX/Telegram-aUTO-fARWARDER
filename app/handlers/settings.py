@@ -22,11 +22,13 @@ def register(client):
             await db.toggle_media_filter(media_type)
         await _show_menu(event)
 
-    @client.on(events.CallbackQuery(pattern=b"^settings:toggle_dedupe$"))
+    @client.on(events.CallbackQuery(pattern=b"^settings:cleanup$"))
     @owner_only_callback
-    async def _toggle_dedupe(event):
-        s = await db.get_settings()
-        await db.update_settings({"dedupe": not s.get("dedupe", True)})
+    async def _cleanup(event):
+        r = await db.cleanup_old_data()
+        await event.answer(
+            f"Cleaned: {r['done_jobs']} done jobs, {r['failed_jobs']} old failed, "
+            f"{r['ledger']} old ledger entries.", alert=True)
         await _show_menu(event)
 
     @client.on(events.CallbackQuery(pattern=b"^settings:toggle_forward_tag$"))
@@ -57,11 +59,13 @@ async def _show_menu(event):
     buttons.append([Button.inline(f"\U0001F648 Hide Forward Tag  {forward_state_label}",
                                    b"settings:toggle_forward_tag")])
 
-    dedupe = settings.get("dedupe", True)
-    lines += ["", "<b>Skip Duplicates</b> \u2014 a file already in the destination (or queued from any "
-              "source) is never sent twice."]
-    dedupe_label = "\u2705 ON" if dedupe else "\u26AB OFF"
-    buttons.append([Button.inline(f"\u267B\uFE0F Skip Duplicates  {dedupe_label}",
-                                   b"settings:toggle_dedupe")])
-    buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:home")])
+    try:
+        info = await db.storage_info()
+        size_text = f"{info['data_mb']:.1f} MB data / {info['storage_mb']:.1f} MB on disk"
+    except Exception:
+        size_text = "n/a"
+    lines.append("")
+    lines.append(f"<b>Database size:</b> {size_text}")
+    buttons.append([Button.inline("\U0001F9F9 Clean Now", b"settings:cleanup")])
+    buttons.append([Button.inline("\u2B05\uFE0F Back to Dashboard", b"ctl:refresh")])
     await event.edit("\n".join(lines), parse_mode="html", buttons=buttons)

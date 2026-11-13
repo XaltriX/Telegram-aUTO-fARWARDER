@@ -18,15 +18,14 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
-from telethon.errors import FloodWaitError, MediaCaptionTooLongError
-from telethon.extensions import html as tg_html
-from telethon.tl.types import (MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage)
+from telethon.errors import FloodWaitError
+from telethon.tl.types import Channel, Chat
 
 from app.config import config
 from app.database import db
 from app.models import JobStatus, SourceMessageGoneError
 from app.telegram_client import account_manager
-from app.utils.helpers import is_retryable_exception, message_link
+from app.utils.helpers import is_retryable_exception
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +38,14 @@ class Scheduler:
         self.on_job_done: Optional[Callable] = None
         self.on_job_failed: Optional[Callable] = None
         self.on_flood_wait: Optional[Callable] = None
-        self._cb_tasks = set()
-        self._consec_fail = 0
-        self.on_auto_pause: Optional[Callable] = None
+        self._entity_cache = {}
+
+    async def _get_entity(self, client, channel_id: int):
+        if channel_id in self._entity_cache:
+            return self._entity_cache[channel_id]
+        entity = await client.get_entity(channel_id)
+        self._entity_cache[channel_id] = entity
+        return entity
 
     async def run(self):
         self.running = True
@@ -60,10 +64,6 @@ class Scheduler:
                 flood_until = settings.get("flood_wait_until")
                 if flood_until and datetime.now(timezone.utc).timestamp() < flood_until:
                     await asyncio.sleep(1)
-                    continue
-
-                if not settings.get("destination_channel_id"):
-                    await asyncio.sleep(3)  # nothing to do until a destination exists
                     continue
 
                 client = await account_manager.get_client()
@@ -98,15 +98,15 @@ class Scheduler:
 
         try:
             settings = await db.get_settings()
-            destination_id = settings.get("destination_channel_id")
+            destination_id = job.get("destination_channel_id") or settings.get("destination_channel_id")
             if not destination_id:
                 await db.fail_job(job_id, "No destination configured")
                 if self.on_job_failed:
                     await self._safe_call(self.on_job_failed, job, "No destination configured")
                 return
 
-            source_entity = await account_manager.get_entity(job["source_channel_id"])
-            dest_entity = await account_manager.get_entity(destination_id)
+            source_entity = await self._get_entity(client, job["source_channel_id"])
+            dest_entity = await self._get_entity(client, destination_id)
 
             message_ids = job.get("message_ids") or [job["source_message_id"]]
             hide_tag = settings.get("hide_forward_tag", True)
@@ -123,16 +123,7 @@ class Scheduler:
                 forwarded_id = getattr(result, "id", None)
 
             await db.mark_job_done(job_id, forwarded_id)
-            source = await db.get_source(job["source_channel_id"])
-            entry = {
-                "title": job.get("title") or f"{job['media_type']} #{job['source_message_id']}",
-                "link": message_link(source, job["source_message_id"]) if source else None,
-                "type": job["media_type"], "n": len(message_ids),
-                "size": job.get("file_size") or 0, "at": datetime.now(timezone.utc),
-            }
-            await db.record_forward_success(len(message_ids), entry)
-            await db.add_dest_fps(destination_id, job.get("fps") or [], forwarded_id)
-            self._consec_fail = 0
+            await db.record_forward_success()
             await db.incr_source_stat(job["source_channel_id"], "forwarded", len(message_ids))
 
             if self.on_job_done:
@@ -144,7 +135,7 @@ class Scheduler:
             flood_until = (datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)).timestamp()
             await db.set_flood_wait_until(flood_until)
             # Put the job back exactly where it was - no progress lost, no duplicate risk.
-            await db.requeue_job(job_id, f"FloodWaitError: {wait_seconds}s", count_attempt=False)
+            await db.requeue_job(job_id, f"FloodWaitError: {wait_seconds}s")
             if self.on_flood_wait:
                 await self._safe_call(self.on_flood_wait, job, wait_seconds)
             await asyncio.sleep(wait_seconds)
@@ -157,7 +148,6 @@ class Scheduler:
 
             if not is_retryable_exception(e) or attempts >= config.MAX_ATTEMPTS:
                 await db.fail_job(job_id, error_text)
-                await self._count_failure(e)
                 await db.record_forward_failure(error_text)
                 await db.incr_source_stat(job["source_channel_id"], "failed")
                 if self.on_job_failed:
@@ -166,33 +156,18 @@ class Scheduler:
                 backoff = config.RETRY_BACKOFF_BASE * attempts
                 retry_after = datetime.now(timezone.utc) + timedelta(seconds=backoff)
                 await db.requeue_job(job_id, error_text, retry_after=retry_after)
-                logger.info("Job %s will retry in %ss (%d/%d)", job_id, backoff, attempts, config.MAX_ATTEMPTS)
+                if self.on_job_failed:
+                    await self._safe_call(self.on_job_failed, job, f"{error_text} (retry {attempts}/{config.MAX_ATTEMPTS})")
+                await asyncio.sleep(min(backoff, 10))
 
-    async def _count_failure(self, exc):
-        """Many terminal failures in a row = a config problem (permissions,
-        wrong destination). Pause instead of burning through the whole queue."""
-        if isinstance(exc, SourceMessageGoneError):
-            return
-        self._consec_fail += 1
-        if self._consec_fail >= 10:
-            self._consec_fail = 0
-            await db.set_paused(True)
-            logger.error("10 consecutive failures - auto-paused")
-            if self.on_auto_pause:
-                await self._safe_call(self.on_auto_pause)
-
-    async def _safe_call(self, fn, *args):
-        """Fire-and-forget: UI callbacks must never slow down forwarding."""
-        async def _run():
-            try:
-                result = fn(*args)
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception:
-                logger.exception("Error in scheduler callback")
-        t = asyncio.create_task(_run())
-        self._cb_tasks.add(t)
-        t.add_done_callback(self._cb_tasks.discard)
+    @staticmethod
+    async def _safe_call(fn, *args):
+        try:
+            result = fn(*args)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            logger.exception("Error in scheduler callback")
 
     # ------------------------------------------------------------------
     # "Hide forward tag" mode: re-send the content as a brand new message
@@ -217,38 +192,39 @@ class Scheduler:
 
     @staticmethod
     async def _copy_single(client, dest_entity, msg):
-        media = msg.media
-        if isinstance(media, (MessageMediaPhoto, MessageMediaDocument)):
-            try:
-                return await client.send_file(
-                    dest_entity, media, caption=msg.message or "",
-                    formatting_entities=msg.entities, parse_mode=None)
-            except MediaCaptionTooLongError:
-                # account can't attach this long a caption: send file, then the full text under it
-                sent = await client.send_file(dest_entity, media)
-                await client.send_message(dest_entity, msg.message, formatting_entities=msg.entities,
-                                          parse_mode=None, reply_to=sent)
-                return sent
-        if media is None or isinstance(media, MessageMediaWebPage):
-            return await client.send_message(
-                dest_entity, msg.message or "", formatting_entities=msg.entities,
-                parse_mode=None, link_preview=isinstance(media, MessageMediaWebPage))
-        # polls, locations, contacts...: can't be re-sent by reference -> native forward
-        return await client.forward_messages(dest_entity, msg)
+        if msg.file:
+            return await client.send_file(
+                dest_entity, msg.media,
+                caption=msg.message or "",
+                formatting_entities=msg.entities,
+                parse_mode=None,
+            )
+        return await client.send_message(
+            dest_entity, msg.message or "",
+            formatting_entities=msg.entities,
+            parse_mode=None,
+        )
 
     @staticmethod
     async def _copy_album(client, dest_entity, msgs):
-        msgs = [m for m in sorted(msgs, key=lambda m: m.id) if m.media]
-        captions = [tg_html.unparse(m.message or "", m.entities or []) for m in msgs]
-        media = [m.media for m in msgs]
-        try:
-            return await client.send_file(dest_entity, media, caption=captions, parse_mode="html")
-        except MediaCaptionTooLongError:
-            sent = await client.send_file(dest_entity, media)
-            text = "\n\n".join(c for c in captions if c)
-            if text:
-                await client.send_message(dest_entity, text[:4096], parse_mode="html", reply_to=sent[0])
-            return sent
+        msgs = sorted(msgs, key=lambda m: m.id)
+        media_list = [m.media for m in msgs if m.media]
+        # NOTE: Telethon's album send only supports one caption string (or
+        # a list of per-item plain strings) - per-item rich formatting
+        # entities are not preserved for albums the way they are for single
+        # messages. This is a known, documented simplification.
+        captions = [m.message or "" for m in msgs if m.media]
+        return await client.send_file(dest_entity, media_list, caption=captions, parse_mode=None)
+
+
+class SourceMessageGoneError(Exception):
+    """Raised when a source message was deleted before we could copy it."""
+    pass
+
+
+class SourceMessageGoneError(Exception):
+    """Raised when a source message was deleted before we could copy it."""
+    pass
 
 
 scheduler = Scheduler()
